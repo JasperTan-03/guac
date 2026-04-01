@@ -1,6 +1,9 @@
 # Project-specific
 data/
 checkpoints/
+mlruns/
+results/
+outputs/
 .claude/
 
 # Byte-compiled / optimized / DLL files

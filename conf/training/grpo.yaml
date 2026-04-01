@@ -1,0 +1,35 @@
+output_dir: checkpoints
+
+# Batch / optimisation
+batch_size: 2
+group_size: 4
+gradient_accumulation_steps: 4
+learning_rate: 1e-5
+weight_decay: 0.01
+max_grad_norm: 1.0
+num_train_steps: 5000
+warmup_steps: 100
+save_steps: 500
+log_steps: 10
+
+# Generation
+max_new_tokens: 128
+temperature: 0.7
+top_p: 0.9
+
+# Curriculum
+sampling_mode: gaussian   # baseline | gaussian
+T_init: 0.5
+eta: 0.05
+alpha: 2.0
+beta: 0.5
+sigma: 0.15
+d_min: 0.0
+d_max: 1.0
+
+# GRPO / KL
+kl_coeff: 0.0
+
+# MLflow
+mlflow_tracking_uri: mlruns
+mlflow_experiment: grpo_curriculum

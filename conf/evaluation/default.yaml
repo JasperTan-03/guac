@@ -1,0 +1,15 @@
+output_path: results/eval_results.json
+batch_size: 4
+
+benchmarks:
+  mathvista:
+    hf_id: AI4Math/MathVista
+    split: testmini
+  mmmu:
+    hf_id: MMMU/MMMU
+    config: Math
+    split: validation
+
+# MLflow
+mlflow_tracking_uri: mlruns
+mlflow_experiment: evaluation

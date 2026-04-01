@@ -1,0 +1,14 @@
+model_name: Qwen/Qwen2-VL-7B-Instruct
+
+# vLLM engine settings
+gpu_memory_utilization: 0.90
+tensor_parallel_size: 1
+max_model_len: 4096
+
+# Inference
+batch_size: 32
+temperature: 0.0
+max_tokens: 16
+
+# Checkpointing (rows between checkpoint writes)
+checkpoint_interval: 500

@@ -1,0 +1,10 @@
+defaults:
+  - data: default
+  - model: qwen2_vl_7b
+  - training: grpo
+  - judge: vllm
+  - evaluation: default
+  - _self_
+
+gpu_id: 7
+seed: 42

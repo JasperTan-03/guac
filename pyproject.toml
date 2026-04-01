@@ -1,20 +1,25 @@
 [project]
 name = "guac"
 version = "0.1.0"
-description = "VLM RL PoC: GRPO training with dynamic difficulty curriculum"
+description = "VLM RL pipeline: GRPO with dynamic difficulty curriculum"
 requires-python = ">=3.11"
 dependencies = [
-    # Data engineering (Phase 1)
+    # Data
     "datasets>=4.0",
     "pillow>=10.0",
-    # VLM inference — also pulls in torch, transformers, tokenizers (Phase 2)
+    # Config management
+    "hydra-core>=1.3",
+    "omegaconf>=2.3",
+    # VLM inference (also pulls in torch, transformers, tokenizers)
     "vllm>=0.18.0",
-    # RL training (Phase 3)
+    # RL training
     "trl>=1.0.0",
     "peft>=0.18.0",
     "accelerate>=1.0",
     "bitsandbytes>=0.49",
-    # Shared utilities
+    # Experiment tracking
+    "mlflow>=2.0",
+    # Utilities
     "tqdm>=4.0",
 ]
 
@@ -22,6 +27,13 @@ dependencies = [
 dev = [
     "ruff>=0.15",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/guac"]
 
 [tool.ruff]
 line-length = 120
