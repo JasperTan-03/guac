@@ -1,6 +1,11 @@
-# guac
+# GUAC: GRPO Utilizing Adaptive Curriculums for Vision Language Models
 
-End-to-end pipeline for training vision-language models (VLMs) with Group Relative Policy Optimization (GRPO) and a dynamic difficulty curriculum. Built on top of Qwen2-VL-7B-Instruct with LoRA fine-tuning.
+**Team:** Jasper Tan, Troy Dutton, Varun Arumugam | *The University of Texas at Austin*
+📄 **[Read the Full Paper / Milestone Report Here](./Deep_RL_Project_Milestone.pdf)**
+
+**TL;DR:** Standard reinforcement learning often trains VLMs on randomly sampled batches, ignoring the inherent difficulty of individual problems. GUAC is an end-to-end pipeline that fine-tunes Qwen2-VL-7B-Instruct using GRPO, testing a novel **Gaussian sampling schedule** against a standard minimum-distance baseline to dynamically pace problem difficulty during training.
+
+---
 
 ```
 Phase 1 — Data Prep         Phase 2 — Difficulty Judging
