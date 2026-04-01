@@ -1,0 +1,32 @@
+[project]
+name = "guac"
+version = "0.1.0"
+description = "VLM RL PoC: GRPO training with dynamic difficulty curriculum"
+requires-python = ">=3.11"
+dependencies = [
+    # Data engineering (Phase 1)
+    "datasets>=4.0",
+    "pillow>=10.0",
+    # VLM inference — also pulls in torch, transformers, tokenizers (Phase 2)
+    "vllm>=0.18.0",
+    # RL training (Phase 3)
+    "trl>=1.0.0",
+    "peft>=0.18.0",
+    "accelerate>=1.0",
+    "bitsandbytes>=0.49",
+    # Shared utilities
+    "tqdm>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.15",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
