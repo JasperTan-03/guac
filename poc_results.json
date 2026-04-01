@@ -1,0 +1,20 @@
+{
+  "model_checkpoint": "./checkpoints/final",
+  "base_model": "Qwen/Qwen2-VL-7B-Instruct",
+  "evaluation_date": "2026-04-01T04:40:12.139193+00:00",
+  "benchmarks": {
+    "MathVista": {
+      "accuracy": 0.2,
+      "correct": 1,
+      "total": 5,
+      "skipped": 0
+    },
+    "MMMU": {
+      "accuracy": 0.2,
+      "correct": 1,
+      "total": 5,
+      "skipped": 0
+    }
+  },
+  "macro_average": 0.2
+}
