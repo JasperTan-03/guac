@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 SPLITS = ["train", "val", "test"]
 
 
-@hydra.main(config_path="../conf", config_name="config", version_base=None)
+@hydra.main(config_path="../conf", config_name="config", version_base="1.2")
 def main(cfg: DictConfig) -> None:
     """Run the difficulty judging pipeline for all splits.
 

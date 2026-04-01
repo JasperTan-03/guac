@@ -33,7 +33,7 @@ from guac.evaluation.evaluator import run_evaluation
 log = logging.getLogger(__name__)
 
 
-@hydra.main(config_path="../conf", config_name="config", version_base=None)
+@hydra.main(config_path="../conf", config_name="config", version_base="1.2")
 def main(cfg: DictConfig) -> None:
     """Run the evaluation pipeline.
 

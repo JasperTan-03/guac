@@ -337,6 +337,8 @@ class GRPOTrainer:
             batch_raw_rewards: List[float] = []
             # KL data: (prompt_input_ids, prompt_attn_mask, generated_ids_list)
             kl_data: List[Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]] = []
+            # Capture the first sample each micro-step for diagnostic logging.
+            _log_sample: Optional[Dict[str, Any]] = None
 
             for record in batch_records:
                 ground_truth: str = str(record.get("answer", ""))
@@ -381,6 +383,14 @@ class GRPOTrainer:
                         ).strip()
                         r = compute_reward(decoded, ground_truth)
                         group_rewards.append(r)
+
+                        # Capture first sample per micro-step for logging.
+                        if _log_sample is None:
+                            _log_sample = {
+                                "pred": decoded,
+                                "gt": ground_truth,
+                                "reward": r,
+                            }
 
                 batch_raw_rewards.extend(group_rewards)
 
@@ -489,6 +499,13 @@ class GRPOTrainer:
                         self.curriculum.T,
                         current_lr,
                     )
+                    if _log_sample is not None:
+                        logger.info(
+                            "  sample | pred=%r | gt=%r | reward=%.1f",
+                            _log_sample["pred"][:120],
+                            _log_sample["gt"][:60],
+                            _log_sample["reward"],
+                        )
                     mlflow.log_metrics(
                         {
                             "train/loss": avg_loss,
@@ -559,7 +576,17 @@ class GRPOTrainer:
             content.append({"type": "image", "image": pil_image})
         content.append({"type": "text", "text": question})
 
-        messages = [{"role": "user", "content": content}]
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a concise math and science problem solver. "
+                    "Provide only your final answer as a number, expression, or short phrase. "
+                    "Do not show working or explanation."
+                ),
+            },
+            {"role": "user", "content": content},
+        ]
 
         # TODO: adjust apply_chat_template kwargs for your VLM processor.
         text = self.processor.apply_chat_template(

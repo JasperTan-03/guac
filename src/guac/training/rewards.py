@@ -11,30 +11,106 @@ Compatible with: torch>=2.3, transformers>=4.45
 """
 
 import math
-from typing import List
+import re
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 
 
-def compute_reward(prediction: str, ground_truth: str) -> float:
-    """Compute a binary reward via case-insensitive exact string match.
+def _extract_final_answer(text: str) -> Optional[str]:
+    """Extract a final answer token from model output.
 
-    Both strings are stripped of leading/trailing whitespace and normalised
-    to a single internal space between words before comparison, so minor
-    spacing differences do not penalise correct answers.
+    Tries the following strategies in order:
+    1. Strip ``<think>...</think>`` reasoning traces.
+    2. Extract the last ``\\boxed{...}`` expression.
+    3. Match explicit answer-prefix patterns (e.g. "the answer is 12").
+    4. Match a trailing ``= <value>`` expression.
+    5. Return the last integer or decimal number in the text.
 
     Args:
-        prediction: Model's predicted answer (stripped of any surrounding
-                    whitespace by the caller or this function).
-        ground_truth: Ground-truth answer.
+        text: Raw decoded output string from the model.
 
     Returns:
-        1.0 if the normalised strings match, 0.0 otherwise.
+        Normalised (stripped, lowercased) answer string, or None if nothing
+        could be extracted.
+    """
+    if not text:
+        return None
+
+    # Strip <think>...</think> reasoning traces
+    think_match = re.search(r"</think>(.*)", text, re.DOTALL | re.IGNORECASE)
+    if think_match:
+        text = think_match.group(1)
+    text = text.strip()
+
+    # Strategy 1: \boxed{...} (last occurrence wins)
+    boxed = re.findall(r"\\boxed\{([^}]+)\}", text)
+    if boxed:
+        return boxed[-1].strip().lower()
+
+    # Strategy 2: explicit answer-prefix patterns
+    prefix_patterns = [
+        r"(?:the\s+)?(?:final\s+)?answer\s+is[:\s]+(.+?)(?:\.|$)",
+        r"(?:therefore|thus|so)[,\s]+(?:the\s+answer\s+is\s+)?([^\s,.]+)",
+    ]
+    for pat in prefix_patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip().lower()
+
+    # Strategy 3: trailing "= value"
+    eq_match = re.search(r"=\s*([^\s=,]+)\s*$", text)
+    if eq_match:
+        return eq_match.group(1).strip().lower()
+
+    # Strategy 4: last number (integer or decimal)
+    nums = re.findall(r"-?\d+(?:\.\d+)?", text)
+    if nums:
+        return nums[-1].lower()
+
+    return None
+
+
+def compute_reward(prediction: str, ground_truth: str) -> float:
+    """Compute a reward for a predicted answer against the ground truth.
+
+    Uses a cascade of matching strategies so that common model verbosity
+    (e.g. "The answer is 12." vs. "12") still yields a positive reward:
+
+    1. Case-insensitive exact match after whitespace normalisation.
+    2. Both sides parsed through ``_extract_final_answer``; extracted tokens
+       compared.
+    3. Substring containment: ground truth (≥ 3 chars) appears verbatim
+       inside the normalised prediction.
+
+    Args:
+        prediction: Model's decoded output string.
+        ground_truth: Ground-truth answer string.
+
+    Returns:
+        1.0 if any matching strategy succeeds, 0.0 otherwise.
     """
     pred_norm = " ".join(prediction.strip().lower().split())
     gt_norm = " ".join(ground_truth.strip().lower().split())
-    return 1.0 if pred_norm == gt_norm else 0.0
+
+    # Strategy 1: exact match
+    if pred_norm == gt_norm:
+        return 1.0
+
+    # Strategy 2: extracted-answer match
+    pred_extracted = _extract_final_answer(prediction)
+    gt_extracted = _extract_final_answer(ground_truth)
+    if pred_extracted is not None and gt_extracted is not None:
+        if pred_extracted == gt_extracted:
+            return 1.0
+
+    # Strategy 3: ground truth appears verbatim in prediction
+    # (guards against false positives from very short strings like "a")
+    if len(gt_norm) >= 3 and gt_norm in pred_norm:
+        return 1.0
+
+    return 0.0
 
 
 def normalize_rewards(rewards: List[float]) -> List[float]:
