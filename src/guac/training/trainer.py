@@ -351,6 +351,10 @@ class GRPOTrainer:
 
                 group_rewards: List[float] = []
                 group_generated_ids: List[torch.Tensor] = []
+                # Old-policy log-probs captured at rollout time (no_grad).
+                # Used as the reference in the GRPO log-ratio loss so the
+                # signal is bounded and independent of sequence length.
+                group_old_log_probs: List[torch.Tensor] = []
 
                 pad_token_id = (
                     self.processor.tokenizer.pad_token_id
@@ -392,6 +396,24 @@ class GRPOTrainer:
                                 "reward": r,
                             }
 
+                        # Compute old-policy log-prob for this response.
+                        # Concatenate prompt mask + ones for generated tokens
+                        # so padding in the prompt is handled correctly.
+                        _gen_len = gen_ids.shape[1]
+                        _full_ids = torch.cat([prompt_inputs["input_ids"], gen_ids], dim=1)
+                        _full_mask = torch.cat([
+                            prompt_inputs["attention_mask"],
+                            torch.ones((1, _gen_len), dtype=prompt_inputs["attention_mask"].dtype, device=self.device),
+                        ], dim=1)
+                        _labels = _full_ids.clone()
+                        _labels[:, :prompt_len] = -100
+                        _extra: Dict[str, torch.Tensor] = {
+                            k: prompt_inputs[k] for k in ("pixel_values", "image_grid_thw")
+                            if k in prompt_inputs
+                        }
+                        old_lp = self._compute_seq_log_probs(_full_ids, _full_mask, _labels, _extra)
+                        group_old_log_probs.append(old_lp)
+
                 batch_raw_rewards.extend(group_rewards)
 
                 # Step 4: Normalise rewards within the group.
@@ -408,19 +430,22 @@ class GRPOTrainer:
                 # Steps 5–6: Teacher-forcing log-probs (train mode)
                 # ----------------------------------------------------------
                 self.model.train()
-                for gen_ids, advantage in zip(group_generated_ids, norm_rewards):
+                for gen_ids, advantage, old_lp in zip(
+                    group_generated_ids, norm_rewards, group_old_log_probs
+                ):
+                    gen_len = gen_ids.shape[1]
                     full_ids = torch.cat(
                         [prompt_inputs["input_ids"], gen_ids], dim=1
                     )  # (1, prompt_len + gen_len)
 
-                    full_mask = torch.ones(
-                        full_ids.shape,
-                        dtype=prompt_inputs["attention_mask"].dtype,
-                        device=self.device,
-                    )
+                    # Preserve prompt padding mask; generated tokens always attend.
+                    full_mask = torch.cat([
+                        prompt_inputs["attention_mask"],
+                        torch.ones((1, gen_len), dtype=prompt_inputs["attention_mask"].dtype, device=self.device),
+                    ], dim=1)
 
                     # Mask prompt positions in labels so they do not contribute
-                    # to the log-prob sum.
+                    # to the log-prob computation.
                     labels = full_ids.clone()
                     labels[:, :prompt_len] = -100
 
@@ -430,10 +455,13 @@ class GRPOTrainer:
                         if k in prompt_inputs:
                             extra_kwargs[k] = prompt_inputs[k]
 
-                    lp = self._compute_seq_log_probs(
+                    new_lp = self._compute_seq_log_probs(
                         full_ids, full_mask, labels, extra_kwargs
                     )
-                    all_log_probs.append(lp)
+                    # GRPO log-ratio: new − old.  Bounded near 0 at init;
+                    # gives a stable, length-normalised training signal.
+                    log_ratio = new_lp - old_lp
+                    all_log_probs.append(log_ratio)
                     all_advantages.append(advantage)
 
             # ----------------------------------------------------------
@@ -650,7 +678,8 @@ class GRPOTrainer:
         ).squeeze(-1)                            # (1, L-1)
 
         valid_mask = (shift_labels != -100).float()
-        return (token_lp * valid_mask).sum()     # scalar
+        n_tokens = valid_mask.sum().clamp(min=1.0)
+        return (token_lp * valid_mask).sum() / n_tokens  # mean per-token log-prob
 
     def _compute_batch_kl(
         self,

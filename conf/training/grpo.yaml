@@ -14,7 +14,7 @@ log_steps: 10
 
 # Generation
 max_new_tokens: 128
-temperature: 0.7
+temperature: 1.0   # higher → more rollout diversity → richer reward signal
 top_p: 0.9
 
 # Curriculum
@@ -24,7 +24,7 @@ eta: 0.05
 alpha: 2.0
 beta: 0.5
 sigma: 0.15
-d_min: 0.0
+d_min: 0.3   # floor prevents T collapsing to trivial problems (all-correct groups)
 d_max: 1.0
 
 # GRPO / KL
