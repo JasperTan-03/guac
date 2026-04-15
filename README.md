@@ -19,12 +19,16 @@ results/eval_results.json   checkpoints/
 
 ## Requirements
 
-- Python 3.11+
-- NVIDIA GPU with ≥80 GB VRAM (tested on H100 80GB)
-- CUDA 12.x
-- [uv](https://docs.astral.sh/uv/) for environment management
+| Use case | Hardware | Deps |
+|---|---|---|
+| **Full training + evaluation** | NVIDIA GPU with ≥ 48 GB VRAM (tested on A6000 48 GB and H100 80 GB), CUDA 12.x | Python 3.11+, [uv](https://docs.astral.sh/uv/), `vllm` (judge phase) |
+| **Local smoke tests** (Mac / CI / any box w/o a GPU) | CPU (≥ 8 GB RAM), any platform | Python 3.11+, `torch`, `transformers`, `peft`, `mlflow`, `omegaconf`, `sympy`, `torchvision`, `pytest` |
+
+The full pipeline is GPU-only in practice (vLLM for Phase 2, 7 B model fine-tuning for Phase 3).  The smoke test exercises the GRPO training *control flow* on a 5 M-param random-weights Qwen2-VL checkpoint so you can validate reward/loss math, flat-group detection, and gradient flow without waiting for a GPU box.
 
 ## Setup
+
+### GPU box (full pipeline)
 
 ```bash
 git clone <repo>
@@ -37,11 +41,28 @@ uv pip install -e ".[dev]"
 
 > **Note:** `vllm` pulls in `torch` automatically. If you need a specific CUDA build, install torch first.
 
-## Running the Pipeline
+### Local machine (smoke tests only)
+
+No venv required — the committed `.venv/` is a Linux/uv venv intended for the GPU box and will not work on macOS.  Install the runtime deps into your system Python (or a local venv) once:
+
+```bash
+python3 -m pip install torch transformers peft mlflow omegaconf sympy torchvision pytest
+```
+
+Then run the smoke suite:
+
+```bash
+bash run/00_smoke_test.sh          # 24 tests, ~10 s on a Mac
+```
+
+This forces `CUDA_VISIBLE_DEVICES=""` so it's reproducible on any machine.
+
+## Running the Pipeline (GPU)
 
 Each phase has a shell wrapper in `run/` and a Hydra script in `scripts/`. The shell wrappers activate the venv for you.
 
 ```bash
+bash run/00_smoke_test.sh         # optional: 10 s sanity check before burning GPU time
 bash run/01_prepare_data.sh       # ~5–10 min: download + write data/raw/ + data/processed/
 bash run/02_judge_difficulty.sh   # ~2 hrs:   score all splits → data/scored/
 bash run/03_train_gaussian.sh     # variable: 5000 steps → checkpoints/
@@ -130,10 +151,22 @@ Key hyperparameters (all in `conf/training/grpo.yaml`):
 | `group_size` | 4 | Rollouts per example |
 | `gradient_accumulation_steps` | 4 | Micro-steps per optimizer step |
 | `learning_rate` | 1e-5 | AdamW LR |
-| `T_init` | 0.5 | Initial curriculum difficulty |
+| `T_init` | 0.3 | Initial curriculum difficulty (= `d_min` so the cold start draws from the easiest bucket — see [AdaRFT Fig. 4](https://arxiv.org/abs/2504.05520)) |
+| `d_min` / `d_max` | 0.3 / 1.0 | Clipping bounds for `T` |
 | `eta` | 0.05 | Curriculum step size |
 | `sigma` | 0.15 | Gaussian bandwidth |
 | `kl_coeff` | 0.0 | KL penalty (0 = disabled) |
+
+### Flat-group diagnostic
+
+With `group_size=4` and a cold policy, every rollout in a group can earn the same binary reward (all 0 or all 1).  Normalised advantages then collapse to `[0,0,0,0]` and the GRPO loss term is exactly zero — no gradient.  The trainer now **skips** these flat groups and surfaces three MLflow metrics every `log_steps`:
+
+- `train/flat_groups_frac` — fraction of groups that collapsed this interval
+- `train/informative_groups` — groups that actually contributed to the loss
+- `train/flat_groups` — groups that were skipped
+
+**Healthy run:** `flat_groups_frac < 0.3` within ~50 steps; `train/reward` climbs toward `β = 0.5`.
+**Stuck run:** `flat_groups_frac > 0.7` — the curriculum isn't in the productive-struggle zone.  Try widening `sigma` (0.15 → 0.25) or lowering `d_min`.
 
 ## Evaluation (Phase 4)
 
@@ -181,10 +214,13 @@ Then open [http://localhost:5000](http://localhost:5000) in your browser.
 
 | Metric | Description |
 |---|---|
-| `train/loss` | GRPO loss |
-| `train/reward` | Mean reward across the batch |
-| `curriculum/T` | Current curriculum target difficulty |
+| `train/loss` | GRPO loss (averaged over informative groups in the window) |
+| `train/reward` | Mean raw reward across the batch |
 | `train/learning_rate` | Scheduler LR |
+| `train/flat_groups_frac` | Fraction of groups skipped because every rollout had the same reward |
+| `train/informative_groups` | Groups that contributed to the loss |
+| `train/flat_groups` | Groups that were skipped |
+| `curriculum/T` | Current curriculum target difficulty |
 
 **Metrics logged during evaluation:**
 
@@ -230,11 +266,16 @@ guac/
 │   ├── train.py
 │   └── evaluate.py
 ├── run/                           # Shell wrappers
+│   ├── 00_smoke_test.sh           # CPU pytest — no GPU or venv required
 │   ├── 01_prepare_data.sh
 │   ├── 02_judge_difficulty.sh
 │   ├── 03_train_gaussian.sh
 │   ├── 03_train_baseline.sh
 │   └── 04_evaluate.sh
+├── tests/                         # CPU-runnable smoke tests (24 tests, ~10 s)
+│   ├── conftest.py
+│   ├── fixtures/smoke/train.jsonl
+│   └── test_training_smoke.py
 ├── data/                          # gitignored
 │   ├── raw/                       # Per-dataset per-split JSONL
 │   ├── processed/                 # Cross-dataset merged splits
@@ -248,6 +289,20 @@ guac/
 ## Linting
 
 ```bash
-.venv/bin/ruff check src/ scripts/
-.venv/bin/ruff check src/ scripts/ --fix
+.venv/bin/ruff check src/ scripts/ tests/
+.venv/bin/ruff check src/ scripts/ tests/ --fix
 ```
+
+On a local machine without the `.venv`:
+
+```bash
+python3 -m ruff check src/ scripts/ tests/
+```
+
+## Troubleshooting
+
+**Training loss stuck at 0.** The binary reward collapses every group to a single value (all 0 or all 1), which zeroes the normalised advantages.  Watch `train/flat_groups_frac` in MLflow — a sustained value above 0.7 means the curriculum is out of the productive-struggle zone.  See the [Flat-group diagnostic](#flat-group-diagnostic) section above.  Run `bash run/00_smoke_test.sh` locally before burning GPU time; the suite catches reward-pipeline regressions in ~10 s.
+
+**`ModuleNotFoundError: No module named 'guac.data'`.** The package lives under `src/guac/data/`.  Either `pip install -e .` (inside the venv) or export `PYTHONPATH=src` when running scripts directly.
+
+**`torch.cuda.OutOfMemoryError` during training.** Drop `training.batch_size`, `training.group_size`, or `training.max_new_tokens` via Hydra override.  The A6000 48 GB fits `batch_size=2 group_size=4 max_new_tokens=128` with LoRA `r=8`.
