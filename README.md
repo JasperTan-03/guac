@@ -20,7 +20,7 @@ results/eval_results.json   checkpoints/
 ## Requirements
 
 - Python 3.11+
-- NVIDIA GPU with ≥80 GB VRAM (tested on H100 80GB)
+- NVIDIA GPU with ≥48 GB VRAM (tested on A6000 48GB)
 - CUDA 12.x
 - [uv](https://docs.astral.sh/uv/) for environment management
 
@@ -100,7 +100,7 @@ Phase 1 writes:
 
 Uses `Qwen/Qwen2-VL-7B-Instruct` via vLLM to score each problem on the [Art of Problem Solving](https://artofproblemsolving.com) 1–10 scale. Scores are normalised to `[0.0, 1.0]` (AoPS score ÷ 10).
 
-- Runs at ~90 rows/sec on H100 with `batch_size=32`
+- Runs at ~90 rows/sec on H100 (~60 rows/sec on A6000) with `batch_size=32`
 - Checkpoints every 500 rows; re-running after a crash resumes automatically
 - Output: `data/scored/{train,val,test}.jsonl` — adds `difficulty`, `difficulty_raw_response`, `difficulty_parse_error`
 
@@ -117,7 +117,7 @@ T_new = clip(T + η · tanh(α · (R_avg − β)), d_min, d_max)
 - `gaussian` *(default)* — weighted sampling: `w_i ∝ exp(−(d_i − T)² / (2σ²))`
 - `baseline` — nearest-neighbour: select B examples with smallest `|d_i − T|`
 
-**LoRA config:** `r=8`, `lora_alpha=16`, targets `q_proj k_proj v_proj o_proj`. The 7B model in bfloat16 (~14 GB) + LoRA fits within 80 GB.
+**LoRA config:** `r=8`, `lora_alpha=16`, targets `q_proj k_proj v_proj o_proj`. The 7B model in bfloat16 (~14 GB) + LoRA fits within 48 GB (A6000). If OOM, override: `training.batch_size=1 training.gradient_accumulation_steps=8`.
 
 Checkpoints saved to `checkpoints/step_N/` every `save_steps` steps and `checkpoints/final/` at completion.
 
