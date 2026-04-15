@@ -419,11 +419,16 @@ class GRPOTrainer:
                 # Step 4: Normalise rewards within the group.
                 norm_rewards = normalize_rewards(group_rewards)
 
-                # Stash for optional KL computation.
+                # Stash for optional KL computation (including vision tensors).
+                vision_kwargs: Dict[str, torch.Tensor] = {
+                    k: prompt_inputs[k] for k in ("pixel_values", "image_grid_thw")
+                    if k in prompt_inputs
+                }
                 kl_data.append((
                     prompt_inputs["input_ids"],
                     prompt_inputs["attention_mask"],
                     group_generated_ids,
+                    vision_kwargs,
                 ))
 
                 # ----------------------------------------------------------
@@ -482,7 +487,7 @@ class GRPOTrainer:
 
             # Optional KL penalty, gated by kl_coeff > 0.
             if self.kl_coeff > 0.0 and self.ref_model is not None:
-                kl_total = self._compute_batch_kl(kl_data, prompt_inputs)
+                kl_total = self._compute_batch_kl(kl_data)
                 loss = loss + self.kl_coeff * kl_total
 
             # ----------------------------------------------------------
@@ -683,8 +688,7 @@ class GRPOTrainer:
 
     def _compute_batch_kl(
         self,
-        kl_data: List[Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]],
-        prompt_inputs: Dict[str, torch.Tensor],
+        kl_data: List[Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]],
     ) -> torch.Tensor:
         """Compute mean KL(policy || reference) over all responses in the batch.
 
@@ -693,11 +697,8 @@ class GRPOTrainer:
         ``compute_kl_penalty`` on the generated-token slice of the logits.
 
         Args:
-            kl_data: List of ``(prompt_ids, prompt_mask, gen_ids_list)``
-                     tuples — one per prompt in the batch.
-            prompt_inputs: The last prompt's input dict (used only to infer
-                           the dtype of the attention mask; not used for
-                           content here).
+            kl_data: List of ``(prompt_ids, prompt_mask, gen_ids_list,
+                     vision_kwargs)`` tuples — one per prompt in the batch.
 
         Returns:
             Scalar mean KL divergence tensor (with gradient through the policy
@@ -706,21 +707,22 @@ class GRPOTrainer:
         kl_total = torch.tensor(0.0, device=self.device)
         n_terms = 0
 
-        for p_ids, p_mask, gen_ids_list in kl_data:
+        for p_ids, p_mask, gen_ids_list, v_kwargs in kl_data:
             for gen_ids in gen_ids_list:
                 full_ids = torch.cat([p_ids, gen_ids], dim=1)
                 gen_len = gen_ids.shape[1]
-                full_mask = torch.ones(
-                    full_ids.shape,
-                    dtype=p_mask.dtype,
-                    device=self.device,
-                )
+                # Preserve the prompt's padding mask; generated tokens attend.
+                full_mask = torch.cat([
+                    p_mask,
+                    torch.ones((1, gen_len), dtype=p_mask.dtype, device=self.device),
+                ], dim=1)
 
                 # Reference forward pass (frozen, no grad).
                 with torch.no_grad():
                     ref_logits = self.ref_model(
                         input_ids=full_ids,
                         attention_mask=full_mask,
+                        **v_kwargs,
                     ).logits[:, -gen_len:, :].float()
 
                 # Policy forward pass (with grad for loss backprop).
@@ -728,6 +730,7 @@ class GRPOTrainer:
                     policy_logits = self.model(
                         input_ids=full_ids,
                         attention_mask=full_mask,
+                        **v_kwargs,
                     ).logits[:, -gen_len:, :].float()
 
                 policy_lp = F.log_softmax(policy_logits, dim=-1)
