@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlflow
 import torch
 import torch.nn.functional as F
+from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoModelForVision2Seq, AutoProcessor, get_cosine_schedule_with_warmup
@@ -114,13 +115,26 @@ class GRPOTrainer:
         tcfg = cfg.training
 
         # ------------------------------------------------------------------
-        # Device
+        # Accelerator / device / rank
         # ------------------------------------------------------------------
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # mixed_precision="no" because bf16 weights + manual autocast are
+        # already managed by this class (see self._autocast_* below).
+        # Letting accelerate layer its own bf16 autocast on top would
+        # double-cast the policy forward pass.
+        self.accelerator = Accelerator(mixed_precision="no")
+        self.device = self.accelerator.device
+        self.is_main: bool = self.accelerator.is_main_process
+        self.rank: int = self.accelerator.process_index
+        self.world_size: int = self.accelerator.num_processes
         if self.device.type != "cuda":
             logger.warning(
                 "No CUDA device found. Training on CPU will be extremely slow "
                 "and is not recommended for production runs."
+            )
+        if self.world_size > 1:
+            logger.info(
+                "Distributed training detected: rank=%d/%d device=%s",
+                self.rank, self.world_size, self.device,
             )
 
         # ------------------------------------------------------------------
@@ -168,6 +182,9 @@ class GRPOTrainer:
             difficulties=difficulties,
             mode=str(tcfg.sampling_mode),
             sigma=float(tcfg.sigma),
+            seed=int(cfg.get("seed", 42)),
+            rank=self.rank,
+            world_size=self.world_size,
         )
 
         # ------------------------------------------------------------------
@@ -231,7 +248,8 @@ class GRPOTrainer:
             task_type=TaskType.CAUSAL_LM,
         )
         self.model = get_peft_model(base_model, lora_config)
-        self.model.print_trainable_parameters()
+        if self.is_main:
+            self.model.print_trainable_parameters()
 
         # ------------------------------------------------------------------
         # Optional frozen reference model for KL penalty
@@ -272,16 +290,33 @@ class GRPOTrainer:
         )
 
         # ------------------------------------------------------------------
-        # MLflow
+        # Distributed wrapping
         # ------------------------------------------------------------------
-        mlflow.set_tracking_uri(str(tcfg.mlflow_tracking_uri))
-        mlflow.set_experiment(str(tcfg.mlflow_experiment))
-        self._mlflow_run = mlflow.start_run()
-        # Log the full resolved config as flat params.
-        mlflow.log_params(OmegaConf.to_container(cfg, resolve=True))
-        logger.info(
-            "MLflow run started: %s", self._mlflow_run.info.run_id
+        # Under DDP this returns a DistributedDataParallel wrapper.  The
+        # wrapper's ``forward`` triggers gradient all-reduce at
+        # ``backward`` time.  In single-process (rank=0, world_size=1)
+        # this is a no-op passthrough.  The reference model (if any) is
+        # intentionally NOT prepared — it's frozen, no optimizer, no
+        # backward, so wrapping it would just waste registering unused
+        # reducers.
+        self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
+            self.model, self.optimizer, self.scheduler,
         )
+
+        # ------------------------------------------------------------------
+        # MLflow (rank 0 only — other ranks leave _mlflow_run as None so
+        # the logging guards below short-circuit cleanly).
+        # ------------------------------------------------------------------
+        self._mlflow_run = None
+        if self.is_main:
+            mlflow.set_tracking_uri(str(tcfg.mlflow_tracking_uri))
+            mlflow.set_experiment(str(tcfg.mlflow_experiment))
+            self._mlflow_run = mlflow.start_run()
+            # Log the full resolved config as flat params.
+            mlflow.log_params(OmegaConf.to_container(cfg, resolve=True))
+            logger.info(
+                "MLflow run started: %s", self._mlflow_run.info.run_id
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -395,12 +430,17 @@ class GRPOTrainer:
                 )
 
                 # ----------------------------------------------------------
-                # Step 2 (cont.): Rollout generation — no_grad, eval mode
+                # Step 2 (cont.): Rollout generation — no_grad, eval mode.
+                # Under DDP, ``self.model`` is a DistributedDataParallel
+                # wrapper that only exposes ``forward()`` — ``generate()``
+                # lives on the inner module.  ``unwrap_model`` is a no-op
+                # in single-process mode.
                 # ----------------------------------------------------------
                 self.model.eval()
+                gen_model = self.accelerator.unwrap_model(self.model)
                 with torch.no_grad():
                     for _ in range(group_size):
-                        gen_out = self.model.generate(
+                        gen_out = gen_model.generate(
                             **prompt_inputs,
                             max_new_tokens=max_new_tokens,
                             do_sample=True,
@@ -506,6 +546,23 @@ class GRPOTrainer:
                 if batch_raw_rewards else 0.0
             )
 
+            # ----------------------------------------------------------
+            # DDP safety: every rank must either call backward() together
+            # or skip it together.  If rank A does backward (firing DDP's
+            # gradient allreduce) while rank B does not, B hangs.  A cheap
+            # boolean all-reduce lets us make a unanimous decision.
+            # ----------------------------------------------------------
+            local_has_signal = torch.tensor(
+                1 if all_log_probs else 0,
+                device=self.device, dtype=torch.long,
+            )
+            if self.world_size > 1:
+                global_has_signal = self.accelerator.reduce(
+                    local_has_signal, reduction="sum",
+                ).item() > 0
+            else:
+                global_has_signal = bool(local_has_signal.item())
+
             if all_log_probs:
                 lp_tensor = torch.stack(all_log_probs)        # (N,)
                 adv_tensor = torch.tensor(
@@ -524,20 +581,36 @@ class GRPOTrainer:
                 # Step 7: Gradient accumulation
                 # ------------------------------------------------------
                 scaled_loss = loss / grad_accum
-                scaled_loss.backward()
+                self.accelerator.backward(scaled_loss)
                 running_loss += loss.item()
                 had_gradient_this_window = True
+            elif global_has_signal:
+                # This rank is flat but at least one other rank has signal
+                # and is calling backward().  We MUST participate in DDP's
+                # gradient allreduce or we deadlock.  Synthesize a
+                # differentiable-zero loss that touches every trainable
+                # parameter, so DDP's reducers fire uniformly and we
+                # contribute exactly zero gradient.
+                trainable = [
+                    p for p in self.model.parameters() if p.requires_grad
+                ]
+                if trainable:
+                    dummy = torch.stack([p.sum() for p in trainable]).sum() * 0.0
+                else:  # pragma: no cover — LoRA always has trainable params
+                    dummy = torch.zeros((), device=self.device, requires_grad=True)
+                self.accelerator.backward(dummy / grad_accum)
+                # running_loss stays at 0 for this micro-step — honest
+                # signal for MLflow (flat_groups_frac captures the collapse).
+                had_gradient_this_window = True
             else:
-                # Every group in this micro-step was flat (all rollouts got
-                # the same reward).  The GRPO term would be exactly 0.  We
-                # still advance micro_step and the curriculum so the loop
-                # makes forward progress toward num_train_steps — otherwise
-                # a persistently cold policy would spin forever.
+                # Every rank is flat this micro-step: skip backward
+                # entirely.  Advance micro_step/global_step below so the
+                # loop terminates at num_train_steps regardless.
                 logger.warning(
-                    "All %d groups were flat this micro-step (rewards "
-                    "collapsed to a single value); skipping backward. "
+                    "All %d groups on rank %d were flat this micro-step "
+                    "(and no other rank had signal); skipping backward. "
                     "If this persists, check reward shaping or curriculum.",
-                    flat_groups,
+                    flat_groups, self.rank,
                 )
 
             micro_step += 1
@@ -551,26 +624,64 @@ class GRPOTrainer:
             # ----------------------------------------------------------
             if micro_step % grad_accum == 0:
                 if had_gradient_this_window:
-                    torch.nn.utils.clip_grad_norm_(
-                        filter(lambda p: p.requires_grad, self.model.parameters()),
-                        max_grad_norm,
+                    # accelerator.clip_grad_norm_ unwraps the DDP wrapper
+                    # and works correctly in single-process mode too.
+                    self.accelerator.clip_grad_norm_(
+                        self.model.parameters(), max_grad_norm,
                     )
                     self.optimizer.step()
                     self.optimizer.zero_grad()
                 self.scheduler.step()
                 global_step += 1
 
-                # Step 8: Curriculum update (exactly once per optimizer step).
-                R_avg = running_reward / grad_accum
+                # ------------------------------------------------------
+                # Step 8: All-reduce running metrics so every rank's
+                # curriculum.update receives the same R_avg (otherwise T
+                # drifts across ranks and the 8 gaussians sample from
+                # incompatible difficulty distributions).
+                # ------------------------------------------------------
+                R_avg_local = running_reward / grad_accum
+                if self.world_size > 1:
+                    r_t = torch.tensor(R_avg_local, device=self.device)
+                    R_avg = self.accelerator.reduce(r_t, reduction="mean").item()
+                else:
+                    R_avg = R_avg_local
                 self.curriculum.update(R_avg)
 
-                # Step 9: Logging.
-                total_groups = running_informative_groups + running_flat_groups
-                flat_frac = (
-                    running_flat_groups / total_groups if total_groups > 0 else 0.0
-                )
-                if global_step % log_steps == 0:
+                # ------------------------------------------------------
+                # Step 9: Logging — all-reduce metrics for MLflow, then
+                # log on rank 0 only.  loss/reward use mean-reduction,
+                # flat/informative counts use sum-reduction.
+                # ------------------------------------------------------
+                if self.world_size > 1:
+                    loss_t = torch.tensor(
+                        running_loss / grad_accum, device=self.device,
+                    )
+                    flat_t = torch.tensor(
+                        float(running_flat_groups), device=self.device,
+                    )
+                    info_t = torch.tensor(
+                        float(running_informative_groups), device=self.device,
+                    )
+                    avg_loss = self.accelerator.reduce(
+                        loss_t, reduction="mean",
+                    ).item()
+                    total_flat = int(self.accelerator.reduce(
+                        flat_t, reduction="sum",
+                    ).item())
+                    total_info = int(self.accelerator.reduce(
+                        info_t, reduction="sum",
+                    ).item())
+                else:
                     avg_loss = running_loss / grad_accum
+                    total_flat = running_flat_groups
+                    total_info = running_informative_groups
+
+                total_groups = total_info + total_flat
+                flat_frac = (
+                    total_flat / total_groups if total_groups > 0 else 0.0
+                )
+                if global_step % log_steps == 0 and self.is_main:
                     current_lr = self.scheduler.get_last_lr()[0]
                     logger.info(
                         "step=%d | loss=%.4f | reward=%.4f | T=%.4f | lr=%.2e "
@@ -580,7 +691,7 @@ class GRPOTrainer:
                         R_avg,
                         self.curriculum.T,
                         current_lr,
-                        running_flat_groups,
+                        total_flat,
                         total_groups,
                     )
                     if _log_sample is not None:
@@ -597,16 +708,20 @@ class GRPOTrainer:
                             "curriculum/T": self.curriculum.T,
                             "train/learning_rate": current_lr,
                             "train/flat_groups_frac": flat_frac,
-                            "train/informative_groups": running_informative_groups,
-                            "train/flat_groups": running_flat_groups,
+                            "train/informative_groups": total_info,
+                            "train/flat_groups": total_flat,
                         },
                         step=global_step,
                     )
 
-                # Step 10: Checkpoint.
+                # Step 10: Checkpoint — rank 0 only; wait for all ranks
+                # to finish this optimizer step first so the saved
+                # weights are consistent with a completed backward.
                 if global_step % save_steps == 0:
-                    ckpt_path = self._save_checkpoint(global_step)
-                    mlflow.log_artifact(ckpt_path)
+                    self.accelerator.wait_for_everyone()
+                    if self.is_main:
+                        ckpt_path = self._save_checkpoint(global_step)
+                        mlflow.log_artifact(ckpt_path)
 
                 # Reset running accumulators for next optimizer step.
                 running_loss = 0.0
@@ -623,15 +738,24 @@ class GRPOTrainer:
                 break
 
         # ------------------------------------------------------------------
-        # Final checkpoint
+        # Final checkpoint — rank 0 only.  Barrier first so every rank
+        # has exited the training loop before we serialise weights.
         # ------------------------------------------------------------------
-        final_dir = self.output_dir / "final"
-        final_dir.mkdir(parents=True, exist_ok=True)
-        self.model.save_pretrained(str(final_dir))
-        self.processor.save_pretrained(str(final_dir))
-        logger.info("Training complete. Final checkpoint saved to %s", final_dir)
-        mlflow.log_artifact(str(final_dir))
-        mlflow.end_run()
+        self.accelerator.wait_for_everyone()
+        if self.is_main:
+            final_dir = self.output_dir / "final"
+            final_dir.mkdir(parents=True, exist_ok=True)
+            # unwrap_model so the saved adapter is plain PEFT weights,
+            # not a DDP-wrapped state_dict.
+            self.accelerator.unwrap_model(self.model).save_pretrained(
+                str(final_dir)
+            )
+            self.processor.save_pretrained(str(final_dir))
+            logger.info(
+                "Training complete. Final checkpoint saved to %s", final_dir,
+            )
+            mlflow.log_artifact(str(final_dir))
+            mlflow.end_run()
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -824,7 +948,11 @@ class GRPOTrainer:
         """
         ckpt_dir = self.output_dir / f"step_{step}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        self.model.save_pretrained(str(ckpt_dir))
+        # unwrap_model so the adapter directory contains plain PEFT
+        # weights, not a DDP-wrapped state_dict.  No-op single-process.
+        self.accelerator.unwrap_model(self.model).save_pretrained(
+            str(ckpt_dir)
+        )
         self.processor.save_pretrained(str(ckpt_dir))
         logger.info("Checkpoint saved to %s", ckpt_dir)
         return str(ckpt_dir)
