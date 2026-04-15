@@ -18,7 +18,7 @@ source .venv/bin/activate
 uv pip install -e ".[dev]"
 ```
 
-**GPU constraint**: All scripts pin to GPU 7 by default. The `gpu_id` value in `conf/config.yaml` is set at the top of each script via `os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)`.
+**GPU constraint**: All scripts pin to GPU 0 by default. The `gpu_id` value in `conf/config.yaml` is set at the top of each script via `os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)`.
 
 Lint before committing:
 
@@ -62,7 +62,7 @@ The project is a 4-phase VLM RL pipeline: data prep → difficulty judging → G
 
 **Curriculum update rule**: `T_new = clip(T + η·tanh(α·(R_avg - β)), d_min, d_max)` — called once per optimizer step.
 
-**Training memory**: LoRA (r=8, targets q/k/v/o_proj) keeps the 7B model trainable within 80 GB VRAM.
+**Training memory**: LoRA (r=8, targets q/k/v/o_proj) keeps the 7B model trainable within 48 GB VRAM (A6000). If OOM, override: `training.batch_size=1 training.gradient_accumulation_steps=8`.
 
 ## Config System
 
