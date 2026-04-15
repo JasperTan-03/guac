@@ -38,6 +38,7 @@ from guac.training.rewards import (
     compute_kl_penalty,
     compute_reward,
     grpo_loss,
+    is_informative_group,
     normalize_rewards,
 )
 
@@ -190,6 +191,23 @@ class GRPOTrainer:
         dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
         model_dtype = dtype_map.get(str(cfg.model.dtype), torch.bfloat16)
 
+        # bfloat16 matmul isn't reliably supported on CPU / MPS.  Coerce to
+        # float32 off-CUDA so the smoke test (and any CPU fallback) works.
+        if model_dtype == torch.bfloat16 and self.device.type != "cuda":
+            logger.warning(
+                "Device %s does not reliably support bfloat16; coercing model "
+                "dtype to float32 for this run.",
+                self.device.type,
+            )
+            model_dtype = torch.float32
+        self._model_dtype = model_dtype
+        # Autocast is only useful on CUDA with bf16/fp16; elsewhere it's a
+        # no-op contextmanager.
+        self._autocast_enabled = self.device.type == "cuda" and model_dtype in (
+            torch.bfloat16, torch.float16,
+        )
+        self._autocast_dtype = model_dtype if self._autocast_enabled else torch.float32
+
         logger.info("Loading base model from %s (%s) ...", cfg.model.name, cfg.model.dtype)
         base_model = AutoModelForVision2Seq.from_pretrained(
             cfg.model.name,
@@ -309,6 +327,14 @@ class GRPOTrainer:
         micro_step = 0      # forward-backward passes (resets at each optimizer step)
         running_loss = 0.0
         running_reward = 0.0
+        running_informative_groups = 0
+        running_flat_groups = 0
+        # Tracks whether any informative micro-step contributed gradient in
+        # the current grad_accum window.  When every micro-step in the
+        # window is flat, we advance global_step and the curriculum anyway
+        # so the loop always terminates at num_train_steps, but we skip
+        # optimizer.step (there's nothing to update).
+        had_gradient_this_window = False
 
         self.model.train()
         self.optimizer.zero_grad()
@@ -335,8 +361,18 @@ class GRPOTrainer:
             all_log_probs: List[torch.Tensor] = []
             all_advantages: List[float] = []
             batch_raw_rewards: List[float] = []
-            # KL data: (prompt_input_ids, prompt_attn_mask, generated_ids_list)
-            kl_data: List[Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]] = []
+            # KL data: (prompt_input_ids, prompt_attn_mask, generated_ids_list,
+            # vision_kwargs).  Only populated for *informative* groups — flat
+            # groups contribute nothing to the loss and must not contribute to
+            # the KL term either.
+            kl_data: List[
+                Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]
+            ] = []
+            # Count informative vs flat groups in this micro-step so the
+            # diagnostic can surface advantage collapse instead of silently
+            # producing zero gradients.
+            informative_groups = 0
+            flat_groups = 0
             # Capture the first sample each micro-step for diagnostic logging.
             _log_sample: Optional[Dict[str, Any]] = None
 
@@ -351,10 +387,6 @@ class GRPOTrainer:
 
                 group_rewards: List[float] = []
                 group_generated_ids: List[torch.Tensor] = []
-                # Old-policy log-probs captured at rollout time (no_grad).
-                # Used as the reference in the GRPO log-ratio loss so the
-                # signal is bounded and independent of sequence length.
-                group_old_log_probs: List[torch.Tensor] = []
 
                 pad_token_id = (
                     self.processor.tokenizer.pad_token_id
@@ -396,42 +428,40 @@ class GRPOTrainer:
                                 "reward": r,
                             }
 
-                        # Compute old-policy log-prob for this response.
-                        # Concatenate prompt mask + ones for generated tokens
-                        # so padding in the prompt is handled correctly.
-                        _gen_len = gen_ids.shape[1]
-                        _full_ids = torch.cat([prompt_inputs["input_ids"], gen_ids], dim=1)
-                        _full_mask = torch.cat([
-                            prompt_inputs["attention_mask"],
-                            torch.ones((1, _gen_len), dtype=prompt_inputs["attention_mask"].dtype, device=self.device),
-                        ], dim=1)
-                        _labels = _full_ids.clone()
-                        _labels[:, :prompt_len] = -100
-                        _extra: Dict[str, torch.Tensor] = {
-                            k: prompt_inputs[k] for k in ("pixel_values", "image_grid_thw")
-                            if k in prompt_inputs
-                        }
-                        old_lp = self._compute_seq_log_probs(_full_ids, _full_mask, _labels, _extra)
-                        group_old_log_probs.append(old_lp)
-
                 batch_raw_rewards.extend(group_rewards)
 
-                # Step 4: Normalise rewards within the group.
+                # Step 4: Detect flat groups.  If every rollout in this group
+                # got the same reward (all 0 or all 1), normalising would
+                # yield all-zero advantages and the GRPO term for this group
+                # would be exactly 0 — a wasted forward/backward pass.  Skip
+                # it, but still include its rewards in batch_raw_rewards so
+                # the curriculum update sees the true success rate.
+                if not is_informative_group(group_rewards):
+                    flat_groups += 1
+                    continue
+                informative_groups += 1
+
+                # Step 4 (cont.): Normalise rewards within the informative group.
                 norm_rewards = normalize_rewards(group_rewards)
 
-                # Stash for optional KL computation.
+                # Stash for optional KL computation (including vision tensors).
+                vision_kwargs: Dict[str, torch.Tensor] = {
+                    k: prompt_inputs[k] for k in ("pixel_values", "image_grid_thw")
+                    if k in prompt_inputs
+                }
                 kl_data.append((
                     prompt_inputs["input_ids"],
                     prompt_inputs["attention_mask"],
                     group_generated_ids,
+                    vision_kwargs,
                 ))
 
                 # ----------------------------------------------------------
                 # Steps 5–6: Teacher-forcing log-probs (train mode)
                 # ----------------------------------------------------------
                 self.model.train()
-                for gen_ids, advantage, old_lp in zip(
-                    group_generated_ids, norm_rewards, group_old_log_probs
+                for gen_ids, advantage in zip(
+                    group_generated_ids, norm_rewards
                 ):
                     gen_len = gen_ids.shape[1]
                     full_ids = torch.cat(
@@ -455,60 +485,79 @@ class GRPOTrainer:
                         if k in prompt_inputs:
                             extra_kwargs[k] = prompt_inputs[k]
 
-                    new_lp = self._compute_seq_log_probs(
+                    # Standard GRPO: use the current policy's log-prob directly.
+                    # L = -E[Â_i · log π_θ(y_i | x_i)]
+                    # _compute_seq_log_probs returns mean per-token log-prob,
+                    # so the signal is already length-normalised.
+                    log_prob = self._compute_seq_log_probs(
                         full_ids, full_mask, labels, extra_kwargs
                     )
-                    # GRPO log-ratio: new − old.  Bounded near 0 at init;
-                    # gives a stable, length-normalised training signal.
-                    log_ratio = new_lp - old_lp
-                    all_log_probs.append(log_ratio)
+                    all_log_probs.append(log_prob)
                     all_advantages.append(advantage)
 
             # ----------------------------------------------------------
             # Step 6 (cont.): GRPO loss
             # ----------------------------------------------------------
-            if not all_log_probs:
-                logger.warning("No log-probs collected this micro-step; skipping.")
-                torch.cuda.empty_cache()
-                continue
-
-            lp_tensor = torch.stack(all_log_probs)        # (N,)
-            adv_tensor = torch.tensor(
-                all_advantages,
-                dtype=torch.float32,
-                device=self.device,
-            )
-            loss = grpo_loss(lp_tensor, adv_tensor)
-
-            # Optional KL penalty, gated by kl_coeff > 0.
-            if self.kl_coeff > 0.0 and self.ref_model is not None:
-                kl_total = self._compute_batch_kl(kl_data, prompt_inputs)
-                loss = loss + self.kl_coeff * kl_total
-
-            # ----------------------------------------------------------
-            # Step 7: Gradient accumulation
-            # ----------------------------------------------------------
-            scaled_loss = loss / grad_accum
-            scaled_loss.backward()
-
-            running_loss += loss.item()
+            # Always update observability counters (even on all-flat).
+            running_informative_groups += informative_groups
+            running_flat_groups += flat_groups
             running_reward += (
                 sum(batch_raw_rewards) / len(batch_raw_rewards)
                 if batch_raw_rewards else 0.0
             )
+
+            if all_log_probs:
+                lp_tensor = torch.stack(all_log_probs)        # (N,)
+                adv_tensor = torch.tensor(
+                    all_advantages,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                loss = grpo_loss(lp_tensor, adv_tensor)
+
+                # Optional KL penalty, gated by kl_coeff > 0.
+                if self.kl_coeff > 0.0 and self.ref_model is not None:
+                    kl_total = self._compute_batch_kl(kl_data)
+                    loss = loss + self.kl_coeff * kl_total
+
+                # ------------------------------------------------------
+                # Step 7: Gradient accumulation
+                # ------------------------------------------------------
+                scaled_loss = loss / grad_accum
+                scaled_loss.backward()
+                running_loss += loss.item()
+                had_gradient_this_window = True
+            else:
+                # Every group in this micro-step was flat (all rollouts got
+                # the same reward).  The GRPO term would be exactly 0.  We
+                # still advance micro_step and the curriculum so the loop
+                # makes forward progress toward num_train_steps — otherwise
+                # a persistently cold policy would spin forever.
+                logger.warning(
+                    "All %d groups were flat this micro-step (rewards "
+                    "collapsed to a single value); skipping backward. "
+                    "If this persists, check reward shaping or curriculum.",
+                    flat_groups,
+                )
+
             micro_step += 1
 
             # ----------------------------------------------------------
-            # Optimizer step — fire every grad_accum micro-steps
+            # Optimizer step — fire every grad_accum micro-steps.
+            # When every micro-step in the window was flat, skip
+            # optimizer.step (no gradient to apply) but still advance the
+            # scheduler, curriculum, and global_step so training always
+            # terminates cleanly at num_train_steps.
             # ----------------------------------------------------------
             if micro_step % grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(
-                    filter(lambda p: p.requires_grad, self.model.parameters()),
-                    max_grad_norm,
-                )
-                self.optimizer.step()
+                if had_gradient_this_window:
+                    torch.nn.utils.clip_grad_norm_(
+                        filter(lambda p: p.requires_grad, self.model.parameters()),
+                        max_grad_norm,
+                    )
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
                 self.scheduler.step()
-                self.optimizer.zero_grad()
                 global_step += 1
 
                 # Step 8: Curriculum update (exactly once per optimizer step).
@@ -516,16 +565,23 @@ class GRPOTrainer:
                 self.curriculum.update(R_avg)
 
                 # Step 9: Logging.
+                total_groups = running_informative_groups + running_flat_groups
+                flat_frac = (
+                    running_flat_groups / total_groups if total_groups > 0 else 0.0
+                )
                 if global_step % log_steps == 0:
                     avg_loss = running_loss / grad_accum
                     current_lr = self.scheduler.get_last_lr()[0]
                     logger.info(
-                        "step=%d | loss=%.4f | reward=%.4f | T=%.4f | lr=%.2e",
+                        "step=%d | loss=%.4f | reward=%.4f | T=%.4f | lr=%.2e "
+                        "| flat_groups=%d/%d",
                         global_step,
                         avg_loss,
                         R_avg,
                         self.curriculum.T,
                         current_lr,
+                        running_flat_groups,
+                        total_groups,
                     )
                     if _log_sample is not None:
                         logger.info(
@@ -540,6 +596,9 @@ class GRPOTrainer:
                             "train/reward": R_avg,
                             "curriculum/T": self.curriculum.T,
                             "train/learning_rate": current_lr,
+                            "train/flat_groups_frac": flat_frac,
+                            "train/informative_groups": running_informative_groups,
+                            "train/flat_groups": running_flat_groups,
                         },
                         step=global_step,
                     )
@@ -552,9 +611,13 @@ class GRPOTrainer:
                 # Reset running accumulators for next optimizer step.
                 running_loss = 0.0
                 running_reward = 0.0
+                running_informative_groups = 0
+                running_flat_groups = 0
+                had_gradient_this_window = False
 
             # Free fragmented GPU memory after each micro-step.
-            torch.cuda.empty_cache()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
             if global_step >= num_train_steps:
                 break
@@ -658,7 +721,11 @@ class GRPOTrainer:
             Scalar tensor: sum of log-probs over generated (non-masked)
             token positions.
         """
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        with torch.amp.autocast(
+            self.device.type,
+            dtype=self._autocast_dtype,
+            enabled=self._autocast_enabled,
+        ):
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -683,8 +750,7 @@ class GRPOTrainer:
 
     def _compute_batch_kl(
         self,
-        kl_data: List[Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]],
-        prompt_inputs: Dict[str, torch.Tensor],
+        kl_data: List[Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]],
     ) -> torch.Tensor:
         """Compute mean KL(policy || reference) over all responses in the batch.
 
@@ -693,11 +759,8 @@ class GRPOTrainer:
         ``compute_kl_penalty`` on the generated-token slice of the logits.
 
         Args:
-            kl_data: List of ``(prompt_ids, prompt_mask, gen_ids_list)``
-                     tuples — one per prompt in the batch.
-            prompt_inputs: The last prompt's input dict (used only to infer
-                           the dtype of the attention mask; not used for
-                           content here).
+            kl_data: List of ``(prompt_ids, prompt_mask, gen_ids_list,
+                     vision_kwargs)`` tuples — one per prompt in the batch.
 
         Returns:
             Scalar mean KL divergence tensor (with gradient through the policy
@@ -706,28 +769,34 @@ class GRPOTrainer:
         kl_total = torch.tensor(0.0, device=self.device)
         n_terms = 0
 
-        for p_ids, p_mask, gen_ids_list in kl_data:
+        for p_ids, p_mask, gen_ids_list, v_kwargs in kl_data:
             for gen_ids in gen_ids_list:
                 full_ids = torch.cat([p_ids, gen_ids], dim=1)
                 gen_len = gen_ids.shape[1]
-                full_mask = torch.ones(
-                    full_ids.shape,
-                    dtype=p_mask.dtype,
-                    device=self.device,
-                )
+                # Preserve the prompt's padding mask; generated tokens attend.
+                full_mask = torch.cat([
+                    p_mask,
+                    torch.ones((1, gen_len), dtype=p_mask.dtype, device=self.device),
+                ], dim=1)
 
                 # Reference forward pass (frozen, no grad).
                 with torch.no_grad():
                     ref_logits = self.ref_model(
                         input_ids=full_ids,
                         attention_mask=full_mask,
+                        **v_kwargs,
                     ).logits[:, -gen_len:, :].float()
 
                 # Policy forward pass (with grad for loss backprop).
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                with torch.amp.autocast(
+                    self.device.type,
+                    dtype=self._autocast_dtype,
+                    enabled=self._autocast_enabled,
+                ):
                     policy_logits = self.model(
                         input_ids=full_ids,
                         attention_mask=full_mask,
+                        **v_kwargs,
                     ).logits[:, -gen_len:, :].float()
 
                 policy_lp = F.log_softmax(policy_logits, dim=-1)

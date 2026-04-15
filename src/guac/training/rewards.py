@@ -49,10 +49,14 @@ def _extract_final_answer(text: str) -> Optional[str]:
     if boxed:
         return boxed[-1].strip().lower()
 
-    # Strategy 2: explicit answer-prefix patterns
+    # Strategy 2: explicit answer-prefix patterns.
+    #
+    # The terminator is ``.\s``, ``.$``, or end-of-string — *not* a bare
+    # ``.`` — so decimal numbers like ``0.5`` aren't truncated to ``0``
+    # by the lazy ``.+?`` capture group.
     prefix_patterns = [
-        r"(?:the\s+)?(?:final\s+)?answer\s+is[:\s]+(.+?)(?:\.|$)",
-        r"(?:therefore|thus|so)[,\s]+(?:the\s+answer\s+is\s+)?([^\s,.]+)",
+        r"(?:the\s+)?(?:final\s+)?answer\s+is[:\s]+(.+?)(?:\.\s|\.$|$)",
+        r"(?:therefore|thus|so)[,\s]+(?:the\s+answer\s+is\s+)?([^\s,]+?)(?:\.\s|\.$|,|$)",
     ]
     for pat in prefix_patterns:
         m = re.search(pat, text, re.IGNORECASE)
@@ -72,6 +76,120 @@ def _extract_final_answer(text: str) -> Optional[str]:
     return None
 
 
+_LATEX_CLEAN_REPLACEMENTS = [
+    (r"\\left", ""),
+    (r"\\right", ""),
+    (r"\\cdot", "*"),
+    (r"\\times", "*"),
+    (r"\\pi\b", "pi"),
+    (r"\\sqrt", "sqrt"),
+    (r"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}", r"(\1)/(\2)"),
+    (r"\^\s*\{([^{}]+)\}", r"**(\1)"),
+    (r"\^", "**"),
+    (r"\$+", ""),
+    (r"\\,", ""),
+    (r"\\;", ""),
+    (r"\\!", ""),
+    (r"\\\\", ""),
+]
+
+
+def _normalize_latex_for_sympy(s: str) -> str:
+    """Best-effort rewrite of LaTeX-ish math into SymPy-parsable syntax.
+
+    The transformations are intentionally conservative — we only rewrite
+    constructs that have an unambiguous SymPy equivalent.  Anything we
+    don't recognise is left in place so ``sympify`` can try to parse it.
+    """
+    out = s.strip()
+    # Drop a leading "x = " / "X = " style prefix: ground-truth answers are
+    # sometimes written as "x = 3" while the model outputs just "3".
+    out = re.sub(r"^\s*[a-zA-Z][a-zA-Z_0-9]*\s*=\s*", "", out)
+    # Drop trailing units / text after whitespace-free numerics.
+    for pattern, repl in _LATEX_CLEAN_REPLACEMENTS:
+        out = re.sub(pattern, repl, out)
+    # Remove stray braces that survive after the LaTeX rewrites.
+    out = out.replace("{", "").replace("}", "")
+    return out.strip()
+
+
+# Hard upper bound on how much text we'll hand to SymPy.  Real answers
+# are typically < 50 chars; long model rambles force O(L) parsing work
+# that never produces a match and becomes a CPU hotspot early in training
+# (when most rollouts are wrong).
+_SYMPY_MAX_INPUT_LEN = 200
+
+# Cheap pre-filter: if a string has no digit, math operator, or LaTeX
+# math token, SymPy will never succeed.  Skipping the parse when this is
+# false is ~1000x cheaper than sympify+simplify on a wrong-but-textual
+# rollout.
+_MATH_LIKELY_RE = re.compile(
+    r"[0-9]|[+\-*/^=(){}]|\\frac|\\sqrt|\\pi|\\cdot|\\times"
+)
+
+
+def _looks_like_math(s: str) -> bool:
+    """Return True if ``s`` is worth handing to SymPy.
+
+    False-positive is fine (we'll just do a wasted parse); false-negative
+    means we miss a SymPy equivalence, so err on the side of inclusion.
+    """
+    if not s or len(s) > _SYMPY_MAX_INPUT_LEN:
+        return False
+    return _MATH_LIKELY_RE.search(s) is not None
+
+
+def _sympy_equivalent(a: str, b: str) -> bool:
+    """Return True iff ``a`` and ``b`` represent the same mathematical value.
+
+    Uses :func:`sympy.sympify` on the LaTeX-normalised inputs and checks
+    ``simplify(A - B) == 0``.  Returns False (not raises) on any parse
+    error, non-numeric input, or unevaluated difference — the substring
+    branch of ``compute_reward`` will still handle those cases.
+
+    A cheap ``_looks_like_math`` pre-filter guards the sympify call so
+    that common word-answer rollouts (e.g. ``"the capital is paris"``)
+    don't pay the full parse cost during training.
+
+    Examples that return True:
+        ``"3"`` vs ``"x = 3"``
+        ``"\\frac{1}{2}"`` vs ``"0.5"``
+        ``"\\boxed{3}"`` vs ``"3"``   (caller is expected to strip \\boxed)
+        ``"2*pi"`` vs ``"pi*2"``
+    """
+    # Fast path: if either side doesn't look like math, SymPy can't help.
+    if not (_looks_like_math(a) and _looks_like_math(b)):
+        return False
+
+    try:
+        import sympy
+        from sympy import sympify
+    except ImportError:  # pragma: no cover — sympy is a hard dep
+        return False
+
+    try:
+        a_expr = sympify(_normalize_latex_for_sympy(a))
+        b_expr = sympify(_normalize_latex_for_sympy(b))
+    except (sympy.SympifyError, SyntaxError, TypeError, ValueError):
+        return False
+    except Exception:  # noqa: BLE001 — sympy raises a wide range of errors
+        return False
+
+    try:
+        diff = sympy.simplify(a_expr - b_expr)
+    except Exception:  # noqa: BLE001
+        return False
+
+    # Structural equality via simplify → 0.  Fall back to a tight numeric
+    # comparison for floats that don't simplify symbolically.
+    if diff == 0:
+        return True
+    try:
+        return abs(float(diff)) < 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
 def compute_reward(prediction: str, ground_truth: str) -> float:
     """Compute a reward for a predicted answer against the ground truth.
 
@@ -81,7 +199,9 @@ def compute_reward(prediction: str, ground_truth: str) -> float:
     1. Case-insensitive exact match after whitespace normalisation.
     2. Both sides parsed through ``_extract_final_answer``; extracted tokens
        compared.
-    3. Substring containment: ground truth (≥ 3 chars) appears verbatim
+    3. Symbolic / numeric equivalence via SymPy on the extracted answers
+       (catches "x=3" vs "3", "\\frac{1}{2}" vs "0.5", "2*pi" vs "pi*2").
+    4. Substring containment: ground truth (≥ 3 chars) appears verbatim
        inside the normalised prediction.
 
     Args:
@@ -105,12 +225,57 @@ def compute_reward(prediction: str, ground_truth: str) -> float:
         if pred_extracted == gt_extracted:
             return 1.0
 
-    # Strategy 3: ground truth appears verbatim in prediction
+    # Strategy 3: SymPy symbolic / numeric equivalence.  Matches AdaRFT's
+    # answer-check scheme (Shi et al. 2025) and catches LaTeX↔decimal
+    # mismatches like "0.5" vs "\\frac{1}{2}" that the regex extractor
+    # can't handle (it would pull only the denominator).  We try both the
+    # extracted pred and the raw prediction against the raw ground truth,
+    # since the LaTeX normaliser handles the raw GT better than the
+    # regex-based extractor would.
+    pred_candidates = [c for c in (pred_extracted, prediction) if c]
+    gt_candidates = [c for c in (gt_extracted, ground_truth) if c]
+    for p_cand in pred_candidates:
+        for g_cand in gt_candidates:
+            if _sympy_equivalent(p_cand, g_cand):
+                return 1.0
+
+    # Strategy 4: ground truth appears verbatim in prediction
     # (guards against false positives from very short strings like "a")
     if len(gt_norm) >= 3 and gt_norm in pred_norm:
         return 1.0
 
     return 0.0
+
+
+# A group whose reward std falls below this threshold is treated as
+# uninformative: every rollout got the same reward, so normalised
+# advantages would all be zero and the resulting GRPO loss term would
+# vanish.  The trainer skips such groups rather than backpropagating
+# through a zero signal.
+FLAT_GROUP_STD_EPS = 1e-6
+
+
+def is_informative_group(rewards: List[float]) -> bool:
+    """Return True iff the reward group carries a usable GRPO signal.
+
+    A group is uninformative when every rollout earned (approximately)
+    the same reward — e.g. ``[0, 0, 0, 0]`` or ``[1, 1, 1, 1]``.  In that
+    case ``normalize_rewards`` returns all zeros, so the GRPO loss term
+    ``-mean(advantages * log_probs)`` is exactly zero and ``backward()``
+    produces no gradient.  Callers should skip these groups so that the
+    reported loss reflects only informative examples.
+
+    Args:
+        rewards: Raw reward values for one group.
+
+    Returns:
+        ``True`` if the group's reward std exceeds ``FLAT_GROUP_STD_EPS``.
+    """
+    if len(rewards) < 2:
+        return False
+    mean = sum(rewards) / len(rewards)
+    variance = sum((r - mean) ** 2 for r in rewards) / len(rewards)
+    return math.sqrt(variance) > FLAT_GROUP_STD_EPS
 
 
 def normalize_rewards(rewards: List[float]) -> List[float]:
@@ -128,7 +293,10 @@ def normalize_rewards(rewards: List[float]) -> List[float]:
                  single prompt).  Must be non-empty.
 
     Returns:
-        List of normalised reward values of the same length.
+        List of normalised reward values of the same length.  When the
+        group is flat (variance below ``FLAT_GROUP_STD_EPS``), returns a
+        list of zeros — callers should detect this via
+        :func:`is_informative_group` and skip the group.
 
     Raises:
         ValueError: If ``rewards`` is empty.
@@ -139,7 +307,9 @@ def normalize_rewards(rewards: List[float]) -> List[float]:
     n = len(rewards)
     mean = sum(rewards) / n
     variance = sum((r - mean) ** 2 for r in rewards) / n
-    std = math.sqrt(variance) + 1e-8
+    std = math.sqrt(variance)
+    if std <= FLAT_GROUP_STD_EPS:
+        return [0.0] * n
     return [(r - mean) / std for r in rewards]
 
 

@@ -1,10 +1,15 @@
 # Project-specific
-data/
-checkpoints/
-mlruns/
-results/
-outputs/
+# Top-level-only so it doesn't swallow src/guac/data/ (the Python package).
+/data/
+/checkpoints/
+/mlruns/
+/results/
+/outputs/
 .claude/
+
+# macOS / misc scratch
+.DS_Store
+*.zip
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
