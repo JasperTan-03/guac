@@ -28,6 +28,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from guac.training.curriculum import CurriculumSampler
 from guac.training.rewards import (
     FLAT_GROUP_STD_EPS,
     compute_reward,
@@ -200,6 +201,89 @@ def test_grpo_loss_is_nonzero_when_logprobs_and_advantages_vary():
     assert w.grad is not None and w.grad.abs().item() > 1e-6, (
         f"No gradient reached w; grad={w.grad!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# CurriculumSampler rank-awareness (8-GPU DDP precondition)
+# --------------------------------------------------------------------------- #
+
+
+def _fake_difficulties(n: int = 200) -> List[float]:
+    """Uniform spread of difficulties in [0, 1]."""
+    return [i / max(1, n - 1) for i in range(n)]
+
+
+def test_curriculum_sampler_default_rank_is_single_gpu_behavior():
+    """rank=0, world_size=1 must preserve the original single-GPU API."""
+    diffs = _fake_difficulties(64)
+    sampler = CurriculumSampler(diffs, mode="gaussian", sigma=0.15, seed=42)
+    batch = sampler.sample(batch_size=4, T=0.5)
+    assert len(batch) == 4
+    assert len(set(batch)) == 4  # no duplicates (multinomial without replacement)
+    assert all(0 <= idx < 64 for idx in batch)
+
+
+def test_curriculum_sampler_gaussian_ranks_draw_independently():
+    """Ranks with disjoint torch.Generator seeds should NOT produce identical
+    batches on the same call — otherwise 8-GPU DDP would waste 7/8 compute."""
+    diffs = _fake_difficulties(200)
+    world = 8
+    batches = [
+        CurriculumSampler(
+            diffs, mode="gaussian", sigma=0.15, seed=42, rank=r, world_size=world
+        ).sample(batch_size=4, T=0.5)
+        for r in range(world)
+    ]
+    # Convert to frozensets for a quick pairwise-identity check: if any two
+    # ranks returned the exact same batch, it means the RNG wasn't actually
+    # rank-offset (the bug the rank-aware sampler is designed to prevent).
+    as_sets = [frozenset(b) for b in batches]
+    for i in range(world):
+        for j in range(i + 1, world):
+            assert as_sets[i] != as_sets[j], (
+                f"Rank {i} and rank {j} produced the same gaussian batch "
+                f"{sorted(as_sets[i])!r} — rank-offset RNG is not working."
+            )
+
+
+def test_curriculum_sampler_baseline_ranks_are_disjoint():
+    """In baseline mode, 8 ranks must partition the top-B*world_size list
+    with no overlaps — otherwise the global batch double-counts examples."""
+    diffs = _fake_difficulties(200)
+    world = 8
+    all_indices = []
+    for r in range(world):
+        sampler = CurriculumSampler(
+            diffs, mode="baseline", sigma=0.15, seed=42, rank=r, world_size=world
+        )
+        all_indices.extend(sampler.sample(batch_size=4, T=0.5))
+    assert len(all_indices) == 4 * world
+    assert len(set(all_indices)) == 4 * world, (
+        f"Baseline ranks overlap: got {len(set(all_indices))} unique of "
+        f"{len(all_indices)} total — {all_indices!r}"
+    )
+
+
+def test_curriculum_sampler_baseline_rank_slices_are_stable():
+    """Repeated calls from the same (rank, world_size) must return the same
+    batch — the curriculum update rule relies on T-driven determinism."""
+    diffs = _fake_difficulties(64)
+    s = CurriculumSampler(
+        diffs, mode="baseline", sigma=0.15, seed=42, rank=3, world_size=8
+    )
+    b1 = s.sample(batch_size=2, T=0.5)
+    b2 = s.sample(batch_size=2, T=0.5)
+    assert b1 == b2
+
+
+def test_curriculum_sampler_rejects_batch_exceeding_shard():
+    """batch_size * world_size must be <= dataset size."""
+    diffs = _fake_difficulties(16)
+    s = CurriculumSampler(
+        diffs, mode="gaussian", sigma=0.15, seed=42, rank=0, world_size=8
+    )
+    with pytest.raises(ValueError, match="exceeds dataset size"):
+        s.sample(batch_size=4, T=0.5)   # 4 * 8 = 32 > 16
 
 
 # --------------------------------------------------------------------------- #
