@@ -1,0 +1,27 @@
+# HuggingFace accelerate config for 8x A6000 single-node DDP.
+#
+# Consumed by `accelerate launch --config_file=accelerate_config.yaml ...`
+# (NOT by Hydra — this is accelerate's own config format, distinct from
+# the Hydra configs under conf/).
+#
+# mixed_precision is deliberately "no": the GRPOTrainer already loads
+# model weights in bf16 and wraps forward passes in torch.amp.autocast
+# with the device-aware dtype (see trainer.py _autocast_* fields).
+# Letting accelerate layer another bf16 autocast on top would double-
+# cast the forward pass and conflict with the manual autocast blocks.
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+num_processes: 8
+num_machines: 1
+mixed_precision: 'no'
+use_cpu: false
+machine_rank: 0
+main_training_function: main
+rdzv_backend: static
+same_network: true
+tpu_use_cluster: false
+tpu_use_sudo: false
+downcast_bf16: 'no'
+# Set gpu_ids: 'all' so accelerate auto-discovers all visible GPUs.
+# Override at launch time with `--gpu_ids=0,1,2,3` for a 4-GPU run.
+gpu_ids: all
