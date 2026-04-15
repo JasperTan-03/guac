@@ -38,6 +38,7 @@ from guac.training.rewards import (
     compute_kl_penalty,
     compute_reward,
     grpo_loss,
+    is_informative_group,
     normalize_rewards,
 )
 
@@ -190,6 +191,23 @@ class GRPOTrainer:
         dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
         model_dtype = dtype_map.get(str(cfg.model.dtype), torch.bfloat16)
 
+        # bfloat16 matmul isn't reliably supported on CPU / MPS.  Coerce to
+        # float32 off-CUDA so the smoke test (and any CPU fallback) works.
+        if model_dtype == torch.bfloat16 and self.device.type != "cuda":
+            logger.warning(
+                "Device %s does not reliably support bfloat16; coercing model "
+                "dtype to float32 for this run.",
+                self.device.type,
+            )
+            model_dtype = torch.float32
+        self._model_dtype = model_dtype
+        # Autocast is only useful on CUDA with bf16/fp16; elsewhere it's a
+        # no-op contextmanager.
+        self._autocast_enabled = self.device.type == "cuda" and model_dtype in (
+            torch.bfloat16, torch.float16,
+        )
+        self._autocast_dtype = model_dtype if self._autocast_enabled else torch.float32
+
         logger.info("Loading base model from %s (%s) ...", cfg.model.name, cfg.model.dtype)
         base_model = AutoModelForVision2Seq.from_pretrained(
             cfg.model.name,
@@ -309,6 +327,8 @@ class GRPOTrainer:
         micro_step = 0      # forward-backward passes (resets at each optimizer step)
         running_loss = 0.0
         running_reward = 0.0
+        running_informative_groups = 0
+        running_flat_groups = 0
 
         self.model.train()
         self.optimizer.zero_grad()
@@ -335,8 +355,18 @@ class GRPOTrainer:
             all_log_probs: List[torch.Tensor] = []
             all_advantages: List[float] = []
             batch_raw_rewards: List[float] = []
-            # KL data: (prompt_input_ids, prompt_attn_mask, generated_ids_list)
-            kl_data: List[Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]] = []
+            # KL data: (prompt_input_ids, prompt_attn_mask, generated_ids_list,
+            # vision_kwargs).  Only populated for *informative* groups — flat
+            # groups contribute nothing to the loss and must not contribute to
+            # the KL term either.
+            kl_data: List[
+                Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]
+            ] = []
+            # Count informative vs flat groups in this micro-step so the
+            # diagnostic can surface advantage collapse instead of silently
+            # producing zero gradients.
+            informative_groups = 0
+            flat_groups = 0
             # Capture the first sample each micro-step for diagnostic logging.
             _log_sample: Optional[Dict[str, Any]] = None
 
@@ -394,7 +424,18 @@ class GRPOTrainer:
 
                 batch_raw_rewards.extend(group_rewards)
 
-                # Step 4: Normalise rewards within the group.
+                # Step 4: Detect flat groups.  If every rollout in this group
+                # got the same reward (all 0 or all 1), normalising would
+                # yield all-zero advantages and the GRPO term for this group
+                # would be exactly 0 — a wasted forward/backward pass.  Skip
+                # it, but still include its rewards in batch_raw_rewards so
+                # the curriculum update sees the true success rate.
+                if not is_informative_group(group_rewards):
+                    flat_groups += 1
+                    continue
+                informative_groups += 1
+
+                # Step 4 (cont.): Normalise rewards within the informative group.
                 norm_rewards = normalize_rewards(group_rewards)
 
                 # Stash for optional KL computation (including vision tensors).
@@ -452,8 +493,21 @@ class GRPOTrainer:
             # Step 6 (cont.): GRPO loss
             # ----------------------------------------------------------
             if not all_log_probs:
-                logger.warning("No log-probs collected this micro-step; skipping.")
-                torch.cuda.empty_cache()
+                # Every group in this micro-step was flat (all rollouts got
+                # the same reward).  Normalised advantages would be all 0 →
+                # loss = 0 → no gradient signal.  Skip the optimizer update
+                # so grad_accum only advances on informative signal, and
+                # still refresh the running reward so curriculum can react.
+                if batch_raw_rewards:
+                    running_reward += sum(batch_raw_rewards) / len(batch_raw_rewards)
+                logger.warning(
+                    "All %d groups were flat this micro-step (rewards "
+                    "collapsed to a single value); skipping backward. "
+                    "If this persists, check reward shaping or curriculum.",
+                    flat_groups,
+                )
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
                 continue
 
             lp_tensor = torch.stack(all_log_probs)        # (N,)
@@ -480,6 +534,8 @@ class GRPOTrainer:
                 sum(batch_raw_rewards) / len(batch_raw_rewards)
                 if batch_raw_rewards else 0.0
             )
+            running_informative_groups += informative_groups
+            running_flat_groups += flat_groups
             micro_step += 1
 
             # ----------------------------------------------------------
@@ -500,16 +556,23 @@ class GRPOTrainer:
                 self.curriculum.update(R_avg)
 
                 # Step 9: Logging.
+                total_groups = running_informative_groups + running_flat_groups
+                flat_frac = (
+                    running_flat_groups / total_groups if total_groups > 0 else 0.0
+                )
                 if global_step % log_steps == 0:
                     avg_loss = running_loss / grad_accum
                     current_lr = self.scheduler.get_last_lr()[0]
                     logger.info(
-                        "step=%d | loss=%.4f | reward=%.4f | T=%.4f | lr=%.2e",
+                        "step=%d | loss=%.4f | reward=%.4f | T=%.4f | lr=%.2e "
+                        "| flat_groups=%d/%d",
                         global_step,
                         avg_loss,
                         R_avg,
                         self.curriculum.T,
                         current_lr,
+                        running_flat_groups,
+                        total_groups,
                     )
                     if _log_sample is not None:
                         logger.info(
@@ -524,6 +587,9 @@ class GRPOTrainer:
                             "train/reward": R_avg,
                             "curriculum/T": self.curriculum.T,
                             "train/learning_rate": current_lr,
+                            "train/flat_groups_frac": flat_frac,
+                            "train/informative_groups": running_informative_groups,
+                            "train/flat_groups": running_flat_groups,
                         },
                         step=global_step,
                     )
@@ -536,9 +602,12 @@ class GRPOTrainer:
                 # Reset running accumulators for next optimizer step.
                 running_loss = 0.0
                 running_reward = 0.0
+                running_informative_groups = 0
+                running_flat_groups = 0
 
             # Free fragmented GPU memory after each micro-step.
-            torch.cuda.empty_cache()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
             if global_step >= num_train_steps:
                 break
@@ -642,7 +711,11 @@ class GRPOTrainer:
             Scalar tensor: sum of log-probs over generated (non-masked)
             token positions.
         """
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        with torch.amp.autocast(
+            self.device.type,
+            dtype=self._autocast_dtype,
+            enabled=self._autocast_enabled,
+        ):
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -705,7 +778,11 @@ class GRPOTrainer:
                     ).logits[:, -gen_len:, :].float()
 
                 # Policy forward pass (with grad for loss backprop).
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                with torch.amp.autocast(
+                    self.device.type,
+                    dtype=self._autocast_dtype,
+                    enabled=self._autocast_enabled,
+                ):
                     policy_logits = self.model(
                         input_ids=full_ids,
                         attention_mask=full_mask,
