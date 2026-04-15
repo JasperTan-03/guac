@@ -329,6 +329,12 @@ class GRPOTrainer:
         running_reward = 0.0
         running_informative_groups = 0
         running_flat_groups = 0
+        # Tracks whether any informative micro-step contributed gradient in
+        # the current grad_accum window.  When every micro-step in the
+        # window is flat, we advance global_step and the curriculum anyway
+        # so the loop always terminates at num_train_steps, but we skip
+        # optimizer.step (there's nothing to update).
+        had_gradient_this_window = False
 
         self.model.train()
         self.optimizer.zero_grad()
@@ -492,63 +498,66 @@ class GRPOTrainer:
             # ----------------------------------------------------------
             # Step 6 (cont.): GRPO loss
             # ----------------------------------------------------------
-            if not all_log_probs:
+            # Always update observability counters (even on all-flat).
+            running_informative_groups += informative_groups
+            running_flat_groups += flat_groups
+            running_reward += (
+                sum(batch_raw_rewards) / len(batch_raw_rewards)
+                if batch_raw_rewards else 0.0
+            )
+
+            if all_log_probs:
+                lp_tensor = torch.stack(all_log_probs)        # (N,)
+                adv_tensor = torch.tensor(
+                    all_advantages,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                loss = grpo_loss(lp_tensor, adv_tensor)
+
+                # Optional KL penalty, gated by kl_coeff > 0.
+                if self.kl_coeff > 0.0 and self.ref_model is not None:
+                    kl_total = self._compute_batch_kl(kl_data)
+                    loss = loss + self.kl_coeff * kl_total
+
+                # ------------------------------------------------------
+                # Step 7: Gradient accumulation
+                # ------------------------------------------------------
+                scaled_loss = loss / grad_accum
+                scaled_loss.backward()
+                running_loss += loss.item()
+                had_gradient_this_window = True
+            else:
                 # Every group in this micro-step was flat (all rollouts got
-                # the same reward).  Normalised advantages would be all 0 →
-                # loss = 0 → no gradient signal.  Skip the optimizer update
-                # so grad_accum only advances on informative signal, and
-                # still refresh the running reward so curriculum can react.
-                if batch_raw_rewards:
-                    running_reward += sum(batch_raw_rewards) / len(batch_raw_rewards)
+                # the same reward).  The GRPO term would be exactly 0.  We
+                # still advance micro_step and the curriculum so the loop
+                # makes forward progress toward num_train_steps — otherwise
+                # a persistently cold policy would spin forever.
                 logger.warning(
                     "All %d groups were flat this micro-step (rewards "
                     "collapsed to a single value); skipping backward. "
                     "If this persists, check reward shaping or curriculum.",
                     flat_groups,
                 )
-                if self.device.type == "cuda":
-                    torch.cuda.empty_cache()
-                continue
 
-            lp_tensor = torch.stack(all_log_probs)        # (N,)
-            adv_tensor = torch.tensor(
-                all_advantages,
-                dtype=torch.float32,
-                device=self.device,
-            )
-            loss = grpo_loss(lp_tensor, adv_tensor)
-
-            # Optional KL penalty, gated by kl_coeff > 0.
-            if self.kl_coeff > 0.0 and self.ref_model is not None:
-                kl_total = self._compute_batch_kl(kl_data)
-                loss = loss + self.kl_coeff * kl_total
-
-            # ----------------------------------------------------------
-            # Step 7: Gradient accumulation
-            # ----------------------------------------------------------
-            scaled_loss = loss / grad_accum
-            scaled_loss.backward()
-
-            running_loss += loss.item()
-            running_reward += (
-                sum(batch_raw_rewards) / len(batch_raw_rewards)
-                if batch_raw_rewards else 0.0
-            )
-            running_informative_groups += informative_groups
-            running_flat_groups += flat_groups
             micro_step += 1
 
             # ----------------------------------------------------------
-            # Optimizer step — fire every grad_accum micro-steps
+            # Optimizer step — fire every grad_accum micro-steps.
+            # When every micro-step in the window was flat, skip
+            # optimizer.step (no gradient to apply) but still advance the
+            # scheduler, curriculum, and global_step so training always
+            # terminates cleanly at num_train_steps.
             # ----------------------------------------------------------
             if micro_step % grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(
-                    filter(lambda p: p.requires_grad, self.model.parameters()),
-                    max_grad_norm,
-                )
-                self.optimizer.step()
+                if had_gradient_this_window:
+                    torch.nn.utils.clip_grad_norm_(
+                        filter(lambda p: p.requires_grad, self.model.parameters()),
+                        max_grad_norm,
+                    )
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
                 self.scheduler.step()
-                self.optimizer.zero_grad()
                 global_step += 1
 
                 # Step 8: Curriculum update (exactly once per optimizer step).
@@ -604,6 +613,7 @@ class GRPOTrainer:
                 running_reward = 0.0
                 running_informative_groups = 0
                 running_flat_groups = 0
+                had_gradient_this_window = False
 
             # Free fragmented GPU memory after each micro-step.
             if self.device.type == "cuda":

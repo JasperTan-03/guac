@@ -48,6 +48,50 @@ TINY_MODEL = "hf-internal-testing/tiny-random-Qwen2VLForConditionalGeneration"
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "smoke"
 
 
+def _tiny_model_available() -> bool:
+    """Check whether the tiny Qwen2-VL checkpoint is resolvable.
+
+    Tries the local HF cache first (offline / air-gapped CI), then falls
+    back to a lightweight remote HEAD.  Avoids triggering a multi-hundred
+    MB download inside the test session; the actual weight load is
+    performed by the GRPOTrainer constructor.
+    """
+    import os
+
+    from transformers import AutoConfig
+
+    # Try local cache first — cheap and works offline.
+    try:
+        AutoConfig.from_pretrained(TINY_MODEL, local_files_only=True)
+        return True
+    except Exception:  # noqa: BLE001 — any resolution error is non-fatal
+        pass
+
+    # Network path disabled via HF_HUB_OFFLINE=1 → bail out cleanly.
+    if os.environ.get("HF_HUB_OFFLINE") == "1":
+        return False
+
+    # Last resort: a remote metadata fetch.  Any error (rate limit, DNS,
+    # auth, 5xx) means we can't run the integration tests this session.
+    try:
+        AutoConfig.from_pretrained(TINY_MODEL)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_requires_tiny_model = pytest.mark.skipif(
+    not _tiny_model_available(),
+    reason=(
+        f"Tiny test model {TINY_MODEL!r} is not available in the local "
+        "HF cache and the Hub is unreachable.  Pre-download it with "
+        "`python -c \"from transformers import AutoModelForVision2Seq; "
+        f"AutoModelForVision2Seq.from_pretrained('{TINY_MODEL}')\"`, "
+        "or unset HF_HUB_OFFLINE to allow a network fetch."
+    ),
+)
+
+
 # --------------------------------------------------------------------------- #
 # Unit tests: reward-normalisation / flat-group detection
 # --------------------------------------------------------------------------- #
@@ -244,6 +288,7 @@ def _patched_compute_reward(reward_fn):
     return patch("guac.training.trainer.compute_reward", new=reward_fn)
 
 
+@_requires_tiny_model
 def test_trainer_skips_flat_groups_and_produces_nonzero_loss_on_varied(
     tmp_path: Path, caplog
 ):
@@ -349,12 +394,18 @@ def test_trainer_skips_flat_groups_and_produces_nonzero_loss_on_varied(
     )
 
 
-def test_trainer_all_flat_batch_does_not_crash_and_logs(
+@_requires_tiny_model
+def test_trainer_all_flat_batch_terminates_without_optimizer_step(
     tmp_path: Path, caplog
 ):
-    """When every group in every micro-step is flat, training completes
-    without touching the optimizer — no NaN, no crash, and the
-    warning is emitted."""
+    """When every group in every micro-step is flat, training must
+    *terminate cleanly* at num_train_steps without ever firing the
+    optimizer.  This exercises the fix for the pre-existing infinite-loop
+    bug: before, global_step only advanced on informative micro-steps, so
+    a persistently cold / degenerate policy would spin forever.  Now the
+    trainer advances global_step + curriculum + scheduler on all-flat
+    micro-steps too and simply skips optimizer.step.
+    """
     import logging
 
     from guac.training.trainer import GRPOTrainer
@@ -363,51 +414,33 @@ def test_trainer_all_flat_batch_does_not_crash_and_logs(
         output_dir=tmp_path / "ckpt",
         mlflow_dir=tmp_path / "mlruns",
     )
-    # Cap at 1 step to keep the test fast; all-flat rewards.
-    cfg.training.num_train_steps = 1
+    # Small step budget so the test stays fast even when every micro-step
+    # is flat and the loop runs the full num_train_steps iterations.
+    cfg.training.num_train_steps = 2
+    cfg.training.gradient_accumulation_steps = 1
     reward_fn = _DeterministicReward([0.0, 0.0, 0.0, 0.0])
 
-    captured_grad_norms: List[float] = []
+    optimizer_step_calls = {"n": 0}
 
     with _patched_compute_reward(reward_fn):
         trainer = GRPOTrainer(cfg)
 
         real_step = trainer.optimizer.step
 
-        def step_with_probe(*a, **kw):
-            g_sq = 0.0
-            for p in trainer.model.parameters():
-                if p.requires_grad and p.grad is not None:
-                    g_sq += float(p.grad.detach().abs().pow(2).sum().item())
-            captured_grad_norms.append(g_sq ** 0.5)
+        def counting_step(*a, **kw):
+            optimizer_step_calls["n"] += 1
             return real_step(*a, **kw)
 
-        trainer.optimizer.step = step_with_probe  # type: ignore[assignment]
+        trainer.optimizer.step = counting_step  # type: ignore[assignment]
 
         caplog.set_level(logging.WARNING, logger="guac.training.trainer")
-        # With num_train_steps=1 and every group flat, the while-loop's
-        # global_step never advances; to avoid a hang we cap wall-clock
-        # progress by also capping the number of sampler calls.
-        call_count = {"n": 0}
-        real_sample = trainer.sampler.sample
+        # Must return normally — no exception, no infinite loop.
+        trainer.train()
 
-        def bounded_sample(*a, **kw):
-            call_count["n"] += 1
-            if call_count["n"] > 3:
-                raise RuntimeError(
-                    "all-flat loop ran more than 3 iterations — expected "
-                    "the trainer to continue safely but not spin forever"
-                )
-            return real_sample(*a, **kw)
-
-        trainer.sampler.sample = bounded_sample  # type: ignore[assignment]
-
-        with pytest.raises(RuntimeError, match="all-flat loop"):
-            trainer.train()
-
-    # Optimizer must NOT have run.
-    assert all(g == 0.0 for g in captured_grad_norms), (
-        f"Optimizer fired on all-flat rewards; norms={captured_grad_norms!r}"
+    # The optimizer must never have been called (no informative gradient).
+    assert optimizer_step_calls["n"] == 0, (
+        f"Optimizer fired on all-flat rewards; called "
+        f"{optimizer_step_calls['n']} times"
     )
     warn_text = "\n".join(
         rec.getMessage() for rec in caplog.records if rec.levelno >= 30
