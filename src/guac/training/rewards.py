@@ -113,6 +113,32 @@ def _normalize_latex_for_sympy(s: str) -> str:
     return out.strip()
 
 
+# Hard upper bound on how much text we'll hand to SymPy.  Real answers
+# are typically < 50 chars; long model rambles force O(L) parsing work
+# that never produces a match and becomes a CPU hotspot early in training
+# (when most rollouts are wrong).
+_SYMPY_MAX_INPUT_LEN = 200
+
+# Cheap pre-filter: if a string has no digit, math operator, or LaTeX
+# math token, SymPy will never succeed.  Skipping the parse when this is
+# false is ~1000x cheaper than sympify+simplify on a wrong-but-textual
+# rollout.
+_MATH_LIKELY_RE = re.compile(
+    r"[0-9]|[+\-*/^=(){}]|\\frac|\\sqrt|\\pi|\\cdot|\\times"
+)
+
+
+def _looks_like_math(s: str) -> bool:
+    """Return True if ``s`` is worth handing to SymPy.
+
+    False-positive is fine (we'll just do a wasted parse); false-negative
+    means we miss a SymPy equivalence, so err on the side of inclusion.
+    """
+    if not s or len(s) > _SYMPY_MAX_INPUT_LEN:
+        return False
+    return _MATH_LIKELY_RE.search(s) is not None
+
+
 def _sympy_equivalent(a: str, b: str) -> bool:
     """Return True iff ``a`` and ``b`` represent the same mathematical value.
 
@@ -121,12 +147,20 @@ def _sympy_equivalent(a: str, b: str) -> bool:
     error, non-numeric input, or unevaluated difference — the substring
     branch of ``compute_reward`` will still handle those cases.
 
+    A cheap ``_looks_like_math`` pre-filter guards the sympify call so
+    that common word-answer rollouts (e.g. ``"the capital is paris"``)
+    don't pay the full parse cost during training.
+
     Examples that return True:
         ``"3"`` vs ``"x = 3"``
         ``"\\frac{1}{2}"`` vs ``"0.5"``
         ``"\\boxed{3}"`` vs ``"3"``   (caller is expected to strip \\boxed)
         ``"2*pi"`` vs ``"pi*2"``
     """
+    # Fast path: if either side doesn't look like math, SymPy can't help.
+    if not (_looks_like_math(a) and _looks_like_math(b)):
+        return False
+
     try:
         import sympy
         from sympy import sympify
