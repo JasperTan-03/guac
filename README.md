@@ -21,7 +21,8 @@ results/eval_results.json   checkpoints/
 
 | Use case | Hardware | Deps |
 |---|---|---|
-| **Full training + evaluation** | NVIDIA GPU with ≥ 48 GB VRAM (tested on A6000 48 GB and H100 80 GB), CUDA 12.x | Python 3.11+, [uv](https://docs.astral.sh/uv/), `vllm` (judge phase) |
+| **Full training + evaluation** | 1 NVIDIA GPU with ≥ 48 GB VRAM (A6000 48 GB or H100 80 GB), CUDA 12.x | Python 3.11+, [uv](https://docs.astral.sh/uv/), `vllm` (judge phase) |
+| **Distributed training** (optional) | 8× NVIDIA A6000 48 GB on one node — DDP via `accelerate launch` | Same as above; `accelerate` is a dep |
 | **Local smoke tests** (Mac / CI / any box w/o a GPU) | CPU (≥ 8 GB RAM), any platform | Python 3.11+, `torch`, `transformers`, `peft`, `mlflow`, `omegaconf`, `sympy`, `torchvision`, `pytest` |
 
 The full pipeline is GPU-only in practice (vLLM for Phase 2, 7 B model fine-tuning for Phase 3).  The smoke test exercises the GRPO training *control flow* on a 5 M-param random-weights Qwen2-VL checkpoint so you can validate reward/loss math, flat-group detection, and gradient flow without waiting for a GPU box.
@@ -65,9 +66,33 @@ Each phase has a shell wrapper in `run/` and a Hydra script in `scripts/`. The s
 bash run/00_smoke_test.sh         # optional: 10 s sanity check before burning GPU time
 bash run/01_prepare_data.sh       # ~5–10 min: download + write data/raw/ + data/processed/
 bash run/02_judge_difficulty.sh   # ~2 hrs:   score all splits → data/scored/
-bash run/03_train_gaussian.sh     # variable: 5000 steps → checkpoints/
+bash run/03_train_gaussian.sh     # single GPU:  5000 steps → checkpoints/
+bash run/03_train_gaussian_ddp.sh # 8 GPUs:      distributed via accelerate (see below)
 bash run/04_evaluate.sh           # ~30 min:  MathVista + MMMU → results/
 ```
+
+### Multi-GPU training (8× A6000)
+
+The trainer supports data-parallel DDP via HuggingFace `accelerate`. The committed `accelerate_config.yaml` at the repo root declares 8-process single-node DDP with `mixed_precision: 'no'` (the trainer already manages bf16 weights + manual autocast — letting accelerate layer another bf16 autocast would double-cast).
+
+```bash
+bash run/03_train_gaussian_ddp.sh     # wraps: accelerate launch --config_file=accelerate_config.yaml scripts/train.py ...
+bash run/03_train_baseline_ddp.sh     # same, sampling_mode=baseline
+```
+
+**Effective batch per optimizer step**: with the `gradient_accumulation_steps=1` override baked into the DDP wrapper,
+`batch_size=2 * group_size=4 * world_size=8 * grad_accum=1 = 64 rollouts per step` — same order of magnitude as the single-GPU default (32), so the curriculum update rule keeps similar granularity. Drop the override if you want a 4× larger batch at the cost of coarser curriculum updates.
+
+**Under-the-hood correctness**:
+- `CurriculumSampler` takes `rank` and `world_size` at init. Gaussian mode uses a per-rank `torch.Generator` (seeded via Knuth's multiplicative hash so ranks don't share bit patterns) so the 8 ranks draw disjoint stochastic batches. Baseline mode picks the top-`B·W` globally and slices the rank's share.
+- Every optimizer step all-reduces `R_avg` before `curriculum.update(...)`, so `T` stays bit-identical across ranks and the 8 Gaussians sample from the same distribution family.
+- **Flat-group DDP deadlock guard**: if all rollouts on a rank earn the same reward, normalized advantages collapse to zero and that rank has no gradient signal. A `sum`-reduce of a boolean flag lets every rank make the same decision: if any rank has signal, flat ranks synthesize a differentiable-zero loss that touches every trainable parameter so DDP's gradient allreduce fires uniformly (zero contribution). If no rank has signal, all ranks skip backward together.
+- Rank 0 exclusively handles MLflow logging, checkpoint saves (`accelerator.unwrap_model(self.model).save_pretrained(...)`), and `print_trainable_parameters`. Other ranks leave MLflow alone.
+- Before each checkpoint save, `accelerator.wait_for_everyone()` acts as a barrier so saved weights correspond to a completed optimizer step.
+
+**Single-GPU vs DDP launch differences**: `scripts/train.py` sets `CUDA_VISIBLE_DEVICES=cfg.gpu_id` only when `LOCAL_RANK` is not in the environment. Under `accelerate launch`, accelerate manages device assignment itself; under plain `python scripts/train.py`, the old single-GPU pinning behavior is preserved.
+
+Expected throughput gain: ~6–7× single-GPU (not a full 8× because of DDP allreduce latency + the sync barriers for `R_avg` and running metrics). If it's less than 4×, check `nvidia-smi` for GPU imbalance and look at the per-step logs for ranks diverging on the global-signal collective.
 
 Pass Hydra overrides as extra arguments:
 
