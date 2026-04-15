@@ -33,8 +33,10 @@ def decode_image(b64_str: str) -> Optional[PIL.Image.Image]:
     try:
         raw = base64.b64decode(b64_str)
         return PIL.Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception as e:
-        logger.warning(f"Failed to decode base64 image: {e}")
+    except Exception:
+        # exc_info=True preserves the traceback when debug logging is on;
+        # lazy %-formatting avoids work when the warning is suppressed.
+        logger.warning("Failed to decode base64 image", exc_info=True)
         return None
 
 
@@ -75,10 +77,11 @@ def safe_load_image(image_field) -> Optional[PIL.Image.Image]:
                 return PIL.Image.open(path).convert("RGB")
 
         logger.warning(
-            f"safe_load_image: unrecognised image_field type {type(image_field)}"
+            "safe_load_image: unrecognised image_field type %s",
+            type(image_field),
         )
         return None
 
-    except Exception as e:
-        logger.warning(f"safe_load_image: failed to load image: {e}")
+    except Exception:
+        logger.warning("safe_load_image: failed to load image", exc_info=True)
         return None
