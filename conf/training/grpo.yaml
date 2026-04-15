@@ -19,7 +19,14 @@ top_p: 0.9
 
 # Curriculum
 sampling_mode: gaussian   # baseline | gaussian
-T_init: 0.5
+# T_init starts at d_min so the cold-start draws from the easiest
+# allowed bucket.  AdaRFT (Shi et al. 2025, Fig. 4) shows that starting
+# in the middle of the difficulty range produces an early reward
+# trajectory near 0 — which in a binary-reward setting collapses every
+# group to all-zeros and stalls training.  Starting easy lets the model
+# bootstrap a non-zero success rate; the tanh update then ramps T up
+# toward the productive-struggle zone (reward ≈ β = 0.5).
+T_init: 0.3
 eta: 0.05
 alpha: 2.0
 beta: 0.5
@@ -27,7 +34,12 @@ sigma: 0.15
 d_min: 0.3   # floor prevents T collapsing to trivial problems (all-correct groups)
 d_max: 1.0
 
-# GRPO / KL
+# GRPO / KL.  kl_coeff=0.0 disables the reference-model KL term.
+# NOTE: with binary rewards and a cold policy, "flat groups" (every
+# rollout gets the same reward → advantages = 0 → loss = 0) are the
+# dominant failure mode.  The trainer now skips flat groups and logs
+# train/flat_groups_frac to MLflow; a persistent value > 0.7 after ~50
+# steps means the curriculum is sitting outside the productive zone.
 kl_coeff: 0.0
 
 # MLflow

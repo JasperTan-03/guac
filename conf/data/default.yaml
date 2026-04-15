@@ -1,0 +1,20 @@
+raw_dir: data/raw
+processed_dir: data/processed
+scored_dir: data/scored
+
+datasets:
+  - name: geometry3k
+    hf_id: hiyouga/geometry3k
+    splits: [train, validation, test]
+    filter_no_image: false
+
+  - name: scienceqa
+    hf_id: derek-thomas/ScienceQA
+    splits: [train, validation, test]
+    filter_no_image: true   # skip text-only rows
+
+# Mapping from HF split name → output filename stem
+split_name_map:
+  train: train
+  validation: val
+  test: test
