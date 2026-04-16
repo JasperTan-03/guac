@@ -20,6 +20,7 @@ pytest.importorskip("vllm")
 from guac.judge.difficulty import (  # noqa: E402, I001 — importorskip must run before this import
     compute_continuous_difficulty,
     parse_difficulty_score,
+    shard_records,
 )
 
 
@@ -172,3 +173,41 @@ def test_parse_difficulty_score_respects_score_max():
 
 def test_parse_difficulty_score_first_valid_wins():
     assert parse_difficulty_score("scores: 3, 7, 9") == 3
+
+
+# --------------------------------------------------------------------------- #
+# shard_records (data-parallel judging helper)
+# --------------------------------------------------------------------------- #
+
+def test_shard_records_partitions_and_covers_all():
+    """Every record ends up in exactly one shard; shards are roughly balanced."""
+    records = [{"id": i} for i in range(17)]
+    shards = [shard_records(records, rank=r, world_size=4) for r in range(4)]
+
+    all_ids = sorted(r["id"] for s in shards for r in s)
+    assert all_ids == list(range(17))
+    assert max(len(s) for s in shards) - min(len(s) for s in shards) <= 1
+
+
+def test_shard_records_no_sharding_returns_copy():
+    """``world_size<=1`` should return a copy of the original list unchanged."""
+    records = [{"id": 1}, {"id": 2}]
+    out = shard_records(records, rank=0, world_size=1)
+    assert out == records
+    assert out is not records  # defensive copy, not the same list object
+
+
+def test_shard_records_index_modulo_rule():
+    """Rank r should receive exactly the records where index % world_size == r."""
+    records = [{"id": i} for i in range(12)]
+    W = 3
+    for r in range(W):
+        shard = shard_records(records, rank=r, world_size=W)
+        assert [rec["id"] for rec in shard] == [i for i in range(12) if i % W == r]
+
+
+def test_shard_records_rejects_invalid_rank():
+    with pytest.raises(ValueError):
+        shard_records([{"id": 1}], rank=5, world_size=4)
+    with pytest.raises(ValueError):
+        shard_records([{"id": 1}], rank=-1, world_size=4)

@@ -38,6 +38,41 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Data-parallel sharding
+# ---------------------------------------------------------------------------
+def shard_records(
+    records: List[Dict], rank: int, world_size: int
+) -> List[Dict]:
+    """Return the subset of ``records`` owned by ``rank`` under index-modulo sharding.
+
+    Data-parallel helper: run ``world_size`` copies of the judge, each with
+    a different ``rank`` in ``[0, world_size)``. Each copy processes the
+    records where ``index % world_size == rank`` independently and writes
+    to a shard-specific output file; ``scripts/merge_judge_shards.py``
+    stitches the shards back into a single canonical output afterwards.
+
+    Args:
+        records: The full list of input records.
+        rank: This process's shard index (0-based).
+        world_size: Total number of shards. ``<= 1`` means no sharding.
+
+    Returns:
+        The sublist assigned to ``rank``. When ``world_size <= 1``, a
+        (shallow) copy of ``records`` is returned unchanged.
+
+    Raises:
+        ValueError: If ``rank`` is outside ``[0, world_size)``.
+    """
+    if world_size <= 1:
+        return list(records)
+    if not (0 <= rank < world_size):
+        raise ValueError(
+            f"rank {rank} out of range for world_size {world_size}"
+        )
+    return [r for i, r in enumerate(records) if i % world_size == rank]
+
+
+# ---------------------------------------------------------------------------
 # Output parser (argmax from raw text — kept for diagnostics + text fallback)
 # ---------------------------------------------------------------------------
 def parse_difficulty_score(response: str, score_max: int = 10) -> Optional[int]:
@@ -272,12 +307,20 @@ class DifficultyJudge:
         input_path: str,
         output_path: str,
         checkpoint_path: Optional[str] = None,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> Dict:
         """Score all records in a JSONL file and save annotated output.
 
         Loads input records, optionally resumes from a checkpoint, runs batch
         inference, computes continuous difficulty via logit expectation,
         checkpoints every N rows, and writes the final annotated JSONL.
+
+        When ``world_size > 1`` the input is sharded by
+        ``index % world_size == rank`` and only this rank's share is
+        scored. The caller is responsible for passing a shard-specific
+        ``output_path`` (e.g. ``{stem}.part{rank}-of-{world_size}.jsonl``)
+        so multiple ranks do not collide on the same file.
 
         Args:
             input_path: Path to the input JSONL file. Each line must be a JSON
@@ -286,10 +329,14 @@ class DifficultyJudge:
             output_path: Destination path for the annotated JSONL file.
             checkpoint_path: Optional path for resume-on-crash checkpointing.
                 Defaults to ``{output_path}.ckpt`` when not supplied.
+            rank: This process's shard index (0-based). Ignored when
+                ``world_size <= 1``.
+            world_size: Total number of data-parallel shards. ``1`` (default)
+                means no sharding.
 
         Returns:
-            Summary dict with keys ``total`` (int), ``scored`` (int), and
-            ``parse_errors`` (int).
+            Summary dict with keys ``total`` (int — records owned by this
+            rank), ``scored`` (int), and ``parse_errors`` (int).
         """
         in_path = Path(input_path)
         out_path = Path(output_path)
@@ -300,17 +347,27 @@ class DifficultyJudge:
         )
 
         # ------------------------------------------------------------------
-        # 1. Load input records
+        # 1. Load input records (and shard for data-parallel judging)
         # ------------------------------------------------------------------
         logger.info("Loading records from %s", in_path)
-        records: List[Dict] = load_jsonl(str(in_path))
-        total_input = len(records)
+        all_records: List[Dict] = load_jsonl(str(in_path))
+        total_global = len(all_records)
+
+        records: List[Dict] = shard_records(all_records, rank, world_size)
+        if world_size > 1:
+            logger.info(
+                "Sharded | rank=%d/%d | this_rank_records=%d | global_records=%d",
+                rank,
+                world_size,
+                len(records),
+                total_global,
+            )
 
         null_image_count = sum(1 for r in records if not r.get("image"))
         logger.info(
             "Dataset stats | total=%d | with_image=%d | text_only=%d",
-            total_input,
-            total_input - null_image_count,
+            len(records),
+            len(records) - null_image_count,
             null_image_count,
         )
 

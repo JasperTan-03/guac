@@ -17,6 +17,14 @@ checkpoint_interval: 500
 # Splits to score — each must exist as {cfg.data.processed_dir}/{stem}.jsonl
 splits: [train, val, test]
 
+# Data-parallel judging. Run N copies of the script with different ranks:
+# each rank scores records where (index % world_size == rank) and writes to
+# {scored_dir}/{stem}.part{rank}-of-{world_size}.jsonl. Merge afterwards with
+# scripts/merge_judge_shards.py. See run/02_judge_difficulty_ddp.sh for an
+# 8-GPU launcher. world_size=1 (default) is plain single-GPU judging.
+world_size: 1
+rank: 0
+
 # Rubric upper bound. Used for:
 #   - normalization:  difficulty = E[score] / score_max
 #   - which digit tokens to read: "1".."{min(score_max, 9)}" (vocab single-token digits)

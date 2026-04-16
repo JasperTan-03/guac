@@ -19,6 +19,18 @@ The scorer resumes from a ``.ckpt`` file on crash. After changing the rubric
 the stale ``{cfg.data.scored_dir}/*.ckpt`` before rerunning, otherwise old
 records will be reused verbatim.
 
+Distributed judging (data-parallel across N GPUs):
+  Run N copies with ``judge.world_size=N judge.rank={0..N-1}``. Each rank
+  scores ``index % N == rank`` of the records and writes to
+  ``{scored_dir}/{stem}.part{rank}-of-{world_size}.jsonl`` (and a matching
+  ckpt). After all ranks finish, run ``scripts/merge_judge_shards.py`` to
+  stitch the shards into a single canonical ``{stem}.jsonl``. See
+  ``run/02_judge_difficulty_ddp.sh`` for an 8-GPU launcher.
+
+  The bash launcher assigns each rank its own GPU via ``CUDA_VISIBLE_DEVICES``
+  before entering Python; this script defers to a pre-set ``CUDA_VISIBLE_DEVICES``
+  env var (it only applies ``cfg.gpu_id`` when the env var is absent).
+
 Onboarding a new dataset (zero judge-code edits required):
   1. Add a loader to ``src/guac/data/prep.py`` and register it in ``_LOADERS``.
   2. Add a ``datasets:`` entry in ``conf/data/default.yaml``.
@@ -57,34 +69,60 @@ def main(cfg: DictConfig) -> None:
     Args:
         cfg: Hydra-composed DictConfig from ``conf/config.yaml``.
     """
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)
+    # Respect an externally-set CUDA_VISIBLE_DEVICES (the DDP launcher pins
+    # each rank to a specific GPU before entering Python). Only apply
+    # cfg.gpu_id when the env var is absent, mirroring the LOCAL_RANK
+    # convention in scripts/train.py.
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)
 
     processed_dir = Path(cfg.data.processed_dir)
     scored_dir = Path(cfg.data.scored_dir)
     scored_dir.mkdir(parents=True, exist_ok=True)
 
     splits = list(cfg.judge.splits)
+    world_size = int(cfg.judge.world_size)
+    rank = int(cfg.judge.rank)
+
+    if world_size < 1:
+        raise ValueError(f"judge.world_size must be >= 1, got {world_size}")
+    if not (0 <= rank < world_size):
+        raise ValueError(
+            f"judge.rank={rank} out of range for judge.world_size={world_size}"
+        )
 
     log.info(
-        "Starting difficulty judging | model=%s | batch_size=%d | splits=%s | score_max=%d",
+        "Starting difficulty judging | model=%s | batch_size=%d | splits=%s | score_max=%d | rank=%d/%d",
         cfg.judge.model_name,
         cfg.judge.batch_size,
         splits,
         cfg.judge.score_max,
+        rank,
+        world_size,
     )
 
     judge = DifficultyJudge(cfg)
 
     for split in splits:
         input_path = processed_dir / f"{split}.jsonl"
-        output_path = scored_dir / f"{split}.jsonl"
+        if world_size > 1:
+            output_path = (
+                scored_dir / f"{split}.part{rank}-of-{world_size}.jsonl"
+            )
+        else:
+            output_path = scored_dir / f"{split}.jsonl"
 
         if not input_path.exists():
             log.warning("Input file not found, skipping: %s", input_path)
             continue
 
         log.info("Scoring split=%s | input=%s | output=%s", split, input_path, output_path)
-        summary = judge.score_split(str(input_path), str(output_path))
+        summary = judge.score_split(
+            str(input_path),
+            str(output_path),
+            rank=rank,
+            world_size=world_size,
+        )
         log.info(
             "split=%s done | total=%d | scored=%d | parse_errors=%d",
             split,
