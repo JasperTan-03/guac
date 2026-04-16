@@ -1,21 +1,34 @@
 """Difficulty judging entrypoint.
 
-Scores every record in ``data/processed/{train,val,test}.jsonl`` using a local
-vLLM engine and writes annotated files to ``data/scored/{split}.jsonl``.
+Scores every record in ``{cfg.data.processed_dir}/{stem}.jsonl`` for each
+``stem`` in ``cfg.judge.splits`` using a local vLLM engine, and writes
+annotated files to ``{cfg.data.scored_dir}/{stem}.jsonl``.
 
-Each output record adds three fields to the input:
-  - ``difficulty``             — float in [0.0, 1.0] (AoPS score / 10), or null on parse failure
-  - ``difficulty_raw_response``— raw VLM output string
-  - ``difficulty_parse_error`` — bool
+Each output record carries these difficulty fields:
+  - ``difficulty``              — continuous float in (0, 1), or null on failure
+  - ``difficulty_integer``      — argmax integer (diagnostic)
+  - ``difficulty_probs``        — per-digit softmax probs over the rubric range
+  - ``difficulty_raw_response`` — raw VLM output string
+  - ``difficulty_parse_error``  — bool
 
-The scorer resumes from a ``.ckpt`` file on crash, so re-running after
-interruption picks up where it left off.
+The scorer resumes from a ``.ckpt`` file on crash. After changing the rubric
+(``cfg.judge.system_prompt``) or score range (``cfg.judge.score_max``), delete
+the stale ``{cfg.data.scored_dir}/*.ckpt`` before rerunning, otherwise old
+records will be reused verbatim.
+
+Onboarding a new dataset (zero judge-code edits required):
+  1. Add a loader to ``src/guac/data/prep.py`` and register it in ``_LOADERS``.
+  2. Add a ``datasets:`` entry in ``conf/data/default.yaml``.
+  3. ``bash run/01_prepare_data.sh`` to re-merge into ``data/processed/*.jsonl``.
+  4. ``bash run/02_judge_difficulty.sh`` (optionally with a different rubric:
+     ``judge=<your_yaml>`` or ``'judge.system_prompt="..."' judge.score_max=5``).
 
 Usage::
 
     python scripts/judge_difficulty.py
     python scripts/judge_difficulty.py judge.batch_size=16
-    python scripts/judge_difficulty.py judge.model_name=Qwen/Qwen2-VL-72B-Instruct
+    python scripts/judge_difficulty.py judge.splits=[val]
+    python scripts/judge_difficulty.py judge=vllm_coding
 """
 
 import logging
@@ -29,12 +42,10 @@ from guac.judge.difficulty import DifficultyJudge
 
 log = logging.getLogger(__name__)
 
-SPLITS = ["train", "val", "test"]
-
 
 @hydra.main(config_path="../conf", config_name="config", version_base="1.2")
 def main(cfg: DictConfig) -> None:
-    """Run the difficulty judging pipeline for all splits.
+    """Run the difficulty judging pipeline for every split in ``cfg.judge.splits``.
 
     Args:
         cfg: Hydra-composed DictConfig from ``conf/config.yaml``.
@@ -45,15 +56,19 @@ def main(cfg: DictConfig) -> None:
     scored_dir = Path(cfg.data.scored_dir)
     scored_dir.mkdir(parents=True, exist_ok=True)
 
+    splits = list(cfg.judge.splits)
+
     log.info(
-        "Starting difficulty judging | model=%s | batch_size=%d",
+        "Starting difficulty judging | model=%s | batch_size=%d | splits=%s | score_max=%d",
         cfg.judge.model_name,
         cfg.judge.batch_size,
+        splits,
+        cfg.judge.score_max,
     )
 
     judge = DifficultyJudge(cfg)
 
-    for split in SPLITS:
+    for split in splits:
         input_path = processed_dir / f"{split}.jsonl"
         output_path = scored_dir / f"{split}.jsonl"
 

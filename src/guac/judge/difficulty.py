@@ -1,15 +1,29 @@
 """Difficulty judging module for the VLM RL pipeline.
 
-Scores math/vision problems on the AoPS 1–10 scale using a local vLLM engine.
-Output difficulty values are normalised to [0.0, 1.0] (AoPS score / 10.0).
+Scores problems on a configurable integer rubric (default: AoPS 1–10) using a
+local vLLM engine. Instead of only keeping the argmax integer, we extract
+top-k logprobs at the first generated token position and compute a *continuous*
+expected score:
+
+    E[score] = sum_{i=1..min(score_max, 9)}  i * softmax(logp_i)
+
+``difficulty`` is then ``E[score] / score_max``, a float in roughly
+``(0.1/score_max, 0.9)`` — dense and continuous rather than bucketed to 10
+discrete values. The argmax integer is still stored as ``difficulty_integer``
+for diagnostics.
+
+The rubric text, score range, top-k, and split list are all read from
+``cfg.judge`` so the same code can score any new dataset by overriding
+config values — no judge-code edits required.
 
 Compatible with: vllm>=0.4, omegaconf>=2.3, tqdm>=4.0
 """
 
 import logging
+import math
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from omegaconf import DictConfig
 from tqdm import tqdm
@@ -19,35 +33,9 @@ from guac.data.prep import load_jsonl, save_jsonl
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# AoPS judging prompt
-# ---------------------------------------------------------------------------
-SYSTEM_PROMPT = (
-    "You are a mathematics subject matter expert and competition problem classifier.\n"
-    "Your task is to assess the difficulty of the following mathematical problem on a scale from 1 to 10\n"
-    "using the Art of Problem Solving (AoPS) difficulty rubric:\n"
-    "\n"
-    "AoPS Difficulty Scale:\n"
-    "  1 - Trivial arithmetic or basic definitions (e.g., 2+2, naming a shape)\n"
-    "  2 - Elementary school competition level (e.g., simple word problems, basic fractions)\n"
-    "  3 - Middle school competition level (e.g., AMC 8 easy, MATHCOUNTS Sprint easy)\n"
-    "  4 - AMC 8 hard / AMC 10 easy (e.g., basic algebra, geometry, number theory)\n"
-    "  5 - AMC 10 mid / AMC 12 easy (e.g., intermediate algebra, combinatorics intro)\n"
-    "  6 - AMC 10 hard / AMC 12 mid (e.g., coordinate geometry, modular arithmetic)\n"
-    "  7 - AMC 12 hard / AIME easy (e.g., complex numbers, advanced combinatorics)\n"
-    "  8 - AIME mid (e.g., multi-step proofs, advanced number theory, 3D geometry)\n"
-    "  9 - AIME hard / USAMO easy (e.g., olympiad-level proofs, elegant constructions)\n"
-    "  10 - USAMO/Putnam hard (e.g., research-adjacent, highly non-trivial proofs)\n"
-    "\n"
-    "Instructions:\n"
-    "- Carefully read the problem text and examine any provided image.\n"
-    "- Consider the mathematical concepts required, the number of steps, and the creativity needed.\n"
-    "- Respond with ONLY a single integer between 1 and 10. No explanation, no punctuation, no extra text."
-)
-
 
 # ---------------------------------------------------------------------------
-# Output parser
+# Output parser (argmax from raw text — kept for diagnostics + text fallback)
 # ---------------------------------------------------------------------------
 def parse_difficulty_score(response: str) -> Optional[int]:
     """Extract the first integer in [1, 10] from a raw VLM response string.
@@ -69,15 +57,12 @@ def parse_difficulty_score(response: str) -> Optional[int]:
     if not response:
         return None
 
-    # Normalise whitespace; work on the first line first to handle responses
-    # where the model adds an explanation after the answer.
     first_line = response.strip().split("\n")[0].strip()
     search_text = first_line if first_line else response.strip()
 
     matches = re.findall(r"\b(\d+)\b", search_text)
 
     if not matches:
-        # Last-ditch: scan the entire response.
         matches = re.findall(r"\b(\d+)\b", response)
 
     for match in matches:
@@ -89,16 +74,94 @@ def parse_difficulty_score(response: str) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
-# Prompt builder
+# Continuous expectation from top-k logprobs
 # ---------------------------------------------------------------------------
-def build_messages(prompt: str, image_b64: Optional[str]) -> List[Dict]:
-    """Build an OpenAI-style chat message list for vLLM chat inference.
+def compute_continuous_difficulty(
+    logprobs_at_pos_0: Optional[Dict[int, Any]],
+    tokenizer: Any,
+    score_max: int,
+) -> Tuple[Optional[float], Optional[Dict[str, float]]]:
+    """Compute an expected difficulty score from top-k logprobs.
 
-    The system turn contains the full AoPS difficulty rubric. The user turn
-    contains the problem image (when present) and problem text as typed content
-    blocks. Text-only rows omit the image block entirely.
+    Reads the top-k logprob dict at generation position 0, decodes each
+    token id to its string form, and matches against digit strings
+    ``"1"`` through ``str(min(score_max, 9))``. Log-probs over the matched
+    subset are softmax-normalised to a proper probability distribution and
+    the expectation ``sum(i * p_i)`` is returned.
+
+    ``"10"`` is deliberately excluded when ``score_max == 10``: in the
+    Qwen2 tokenizer ``"10"`` is two tokens whose first token is ``"1"``,
+    which would collide with the ``i=1`` bucket. In our data the 1.0
+    difficulty bucket is effectively empty, so this is a benign
+    approximation.
+
+    When multiple tokens decode to the same digit (e.g. ``"2"`` and
+    ``" 2"``), we keep the one with the highest logprob.
 
     Args:
+        logprobs_at_pos_0: Mapping ``token_id -> Logprob`` for the first
+            generated token, as returned by vLLM when ``SamplingParams``
+            has ``logprobs=k``. May be ``None`` if logprobs were not
+            requested or inference failed.
+        tokenizer: The vLLM model's tokenizer (used to decode token ids).
+        score_max: Upper bound of the rubric (1..score_max). Digit tokens
+            up to ``min(score_max, 9)`` are read.
+
+    Returns:
+        A ``(expectation, probs)`` tuple. ``expectation`` is a float in
+        ``[1.0, min(score_max, 9)]``. ``probs`` is a dict mapping
+        str-digit (``"1"``, ``"2"``, ...) to its softmax-normalised
+        probability — str keys so the dict round-trips cleanly through
+        JSON. Returns ``(None, None)`` when ``logprobs_at_pos_0`` is
+        missing/empty or no digit tokens were found.
+    """
+    if not logprobs_at_pos_0:
+        return None, None
+
+    max_digit = min(int(score_max), 9)
+    digit_targets = {str(i): i for i in range(1, max_digit + 1)}
+
+    digit_logprobs: Dict[int, float] = {}
+    for token_id, lp_obj in logprobs_at_pos_0.items():
+        try:
+            decoded = tokenizer.decode([int(token_id)])
+        except Exception:
+            continue
+        key = decoded.strip()
+        if key not in digit_targets:
+            continue
+        digit = digit_targets[key]
+        lp = float(lp_obj.logprob)
+        if digit not in digit_logprobs or lp > digit_logprobs[digit]:
+            digit_logprobs[digit] = lp
+
+    if not digit_logprobs:
+        return None, None
+
+    max_lp = max(digit_logprobs.values())
+    exps = {d: math.exp(lp - max_lp) for d, lp in digit_logprobs.items()}
+    z = sum(exps.values())
+    probs = {str(d): e / z for d, e in exps.items()}
+    expectation = sum(int(d) * p for d, p in probs.items())
+
+    return expectation, probs
+
+
+# ---------------------------------------------------------------------------
+# Prompt builder
+# ---------------------------------------------------------------------------
+def build_messages(
+    system_prompt: str, prompt: str, image_b64: Optional[str]
+) -> List[Dict]:
+    """Build an OpenAI-style chat message list for vLLM chat inference.
+
+    The system turn contains the rubric (passed in from config). The user
+    turn contains the problem image (when present) and problem text as
+    typed content blocks. Text-only rows omit the image block entirely.
+
+    Args:
+        system_prompt: The rubric / instruction string to use as the
+            system message. Typically sourced from ``cfg.judge.system_prompt``.
         prompt: The problem text to be scored.
         image_b64: Base64-encoded PNG string, or None for text-only problems.
 
@@ -107,7 +170,7 @@ def build_messages(prompt: str, image_b64: Optional[str]) -> List[Dict]:
     """
     system_message: Dict = {
         "role": "system",
-        "content": SYSTEM_PROMPT,
+        "content": system_prompt,
     }
 
     if image_b64:
@@ -119,7 +182,6 @@ def build_messages(prompt: str, image_b64: Optional[str]) -> List[Dict]:
             {"type": "text", "text": prompt},
         ]
     else:
-        # Plain string content is acceptable when there is no image.
         user_content = [{"type": "text", "text": prompt}]
 
     user_message: Dict = {
@@ -136,8 +198,10 @@ def build_messages(prompt: str, image_b64: Optional[str]) -> List[Dict]:
 class DifficultyJudge:
     """vLLM-based difficulty scorer for math and vision problems.
 
-    Loads a multimodal model via vLLM and scores each problem on the AoPS
-    1–10 scale, normalising to [0.0, 1.0] before writing output.
+    Loads a multimodal model via vLLM and scores each problem on a
+    configurable integer rubric (``cfg.judge.score_max``). Uses top-k
+    logprobs at the first generated token to compute a continuous
+    expected score.
 
     Args:
         cfg: Hydra DictConfig whose ``judge`` sub-config must contain:
@@ -149,7 +213,10 @@ class DifficultyJudge:
             - ``batch_size`` (int): Items per inference batch.
             - ``temperature`` (float): Sampling temperature (0.0 for greedy).
             - ``max_tokens`` (int): Maximum tokens to generate per response.
+            - ``logprobs_k`` (int): Top-k logprobs to extract per position.
             - ``checkpoint_interval`` (int): Rows between checkpoint writes.
+            - ``score_max`` (int): Rubric upper bound for normalization.
+            - ``system_prompt`` (str): Rubric text used as the system turn.
     """
 
     def __init__(self, cfg: DictConfig) -> None:
@@ -160,23 +227,30 @@ class DifficultyJudge:
         """
         jcfg = cfg.judge
         logger.info(
-            "Initialising DifficultyJudge | model=%s | tp=%d | gpu_mem=%.2f | max_len=%d",
+            "Initialising DifficultyJudge | model=%s | tp=%d | gpu_mem=%.2f | max_len=%d | score_max=%d | logprobs_k=%d",
             jcfg.model_name,
             jcfg.tensor_parallel_size,
             jcfg.gpu_memory_utilization,
             jcfg.max_model_len,
+            jcfg.score_max,
+            jcfg.logprobs_k,
         )
 
         self._cfg = jcfg
+        self._system_prompt: str = str(jcfg.system_prompt)
+        self._score_max: int = int(jcfg.score_max)
+
         self._llm = LLM(
             model=jcfg.model_name,
             gpu_memory_utilization=jcfg.gpu_memory_utilization,
             tensor_parallel_size=jcfg.tensor_parallel_size,
             max_model_len=jcfg.max_model_len,
         )
+        self._tokenizer = self._llm.get_tokenizer()
         self._sampling_params = SamplingParams(
             temperature=jcfg.temperature,
             max_tokens=jcfg.max_tokens,
+            logprobs=int(jcfg.logprobs_k),
         )
         logger.info("vLLM engine ready.")
 
@@ -192,8 +266,8 @@ class DifficultyJudge:
         """Score all records in a JSONL file and save annotated output.
 
         Loads input records, optionally resumes from a checkpoint, runs batch
-        inference, normalises scores to [0.0, 1.0], checkpoints every N rows,
-        and writes the final annotated JSONL.
+        inference, computes continuous difficulty via logit expectation,
+        checkpoints every N rows, and writes the final annotated JSONL.
 
         Args:
             input_path: Path to the input JSONL file. Each line must be a JSON
@@ -265,20 +339,27 @@ class DifficultyJudge:
         for batch_start in range(0, len(pending), batch_size):
             batch_records = pending[batch_start : batch_start + batch_size]
 
-            raw_responses = self._run_batch(batch_records)
+            raw_results = self._run_batch(batch_records)
 
-            for rec, raw_response in zip(batch_records, raw_responses):
+            for rec, (raw_response, lp0) in zip(batch_records, raw_results):
+                expectation, probs = compute_continuous_difficulty(
+                    lp0, self._tokenizer, self._score_max
+                )
                 score_int = parse_difficulty_score(raw_response)
-                parse_error = score_int is None
+
+                if expectation is not None:
+                    difficulty: Optional[float] = expectation / self._score_max
+                elif score_int is not None:
+                    difficulty = score_int / self._score_max
+                else:
+                    difficulty = None
+
+                parse_error = difficulty is None
 
                 if parse_error:
                     logger.warning(
                         "Parse error | id=%s | raw=%r", rec.get("id"), raw_response
                     )
-
-                difficulty: Optional[float] = (
-                    score_int / 10.0 if score_int is not None else None
-                )
 
                 annotated: Dict = {
                     "id": rec["id"],
@@ -286,6 +367,8 @@ class DifficultyJudge:
                     "prompt": rec["prompt"],
                     "answer": rec["answer"],
                     "difficulty": difficulty,
+                    "difficulty_integer": score_int,
+                    "difficulty_probs": probs,
                     "difficulty_raw_response": raw_response,
                     "difficulty_parse_error": parse_error,
                 }
@@ -294,7 +377,6 @@ class DifficultyJudge:
 
             pbar.update(len(batch_records))
 
-            # Checkpoint flush
             if rows_since_ckpt >= checkpoint_interval:
                 all_so_far = completed_results + new_results
                 logger.info(
@@ -331,7 +413,9 @@ class DifficultyJudge:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
-    def _run_batch(self, batch: List[Dict]) -> List[str]:
+    def _run_batch(
+        self, batch: List[Dict]
+    ) -> List[Tuple[str, Optional[Dict[int, Any]]]]:
         """Run inference on a batch of records via ``llm.chat()``.
 
         Builds conversation lists for every record in ``batch`` and submits
@@ -344,41 +428,52 @@ class DifficultyJudge:
                 ``prompt`` and optionally ``image`` (base64 PNG or null).
 
         Returns:
-            List of raw response strings, one per record. Items that fail even
-            in single-item fallback mode are returned as empty strings.
+            A list of ``(raw_text, logprobs_at_pos_0)`` tuples, one per
+            record. ``logprobs_at_pos_0`` is a dict mapping token_id to a
+            vLLM ``Logprob`` object, or ``None`` if unavailable.
+            Items that fail even in single-item fallback mode are
+            returned as ``("", None)``.
         """
         conversations: List[List[Dict]] = []
         for rec in batch:
             image_b64: Optional[str] = rec.get("image") or None
-            messages = build_messages(rec["prompt"], image_b64)
+            messages = build_messages(
+                self._system_prompt, rec["prompt"], image_b64
+            )
             conversations.append(messages)
+
+        def _extract(output_obj: Any) -> Tuple[str, Optional[Dict[int, Any]]]:
+            gen = output_obj.outputs[0]
+            text = gen.text.strip()
+            lp_list = getattr(gen, "logprobs", None)
+            lp0 = lp_list[0] if lp_list else None
+            return text, lp0
 
         try:
             outputs = self._llm.chat(
                 conversations, sampling_params=self._sampling_params
             )
-            return [out.outputs[0].text.strip() for out in outputs]
+            return [_extract(out) for out in outputs]
 
         except Exception as exc:
             logger.error(
                 "Batch inference failed (%s) — falling back to single-item processing.",
                 exc,
             )
-            results: List[str] = []
+            results: List[Tuple[str, Optional[Dict[int, Any]]]] = []
             for conversation, rec in zip(conversations, batch):
                 try:
                     single_out = self._llm.chat(
                         [conversation], sampling_params=self._sampling_params
                     )
-                    text = single_out[0].outputs[0].text.strip()
+                    results.append(_extract(single_out[0]))
                 except Exception as item_exc:
                     logger.error(
                         "Single-item inference failed | id=%s | error=%s",
                         rec.get("id"),
                         item_exc,
                     )
-                    text = ""
-                results.append(text)
+                    results.append(("", None))
             return results
 
     @staticmethod
