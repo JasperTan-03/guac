@@ -16,6 +16,10 @@ log_steps: 10
 max_new_tokens: 128
 temperature: 1.0   # higher → more rollout diversity → richer reward signal
 top_p: 0.9
+# Hard safety net: if prompt + rollout exceeds this after tokenization,
+# truncate the generation so the forward pass stays bounded.  Catches
+# edge cases where max_pixels doesn't fully prevent long sequences.
+max_seq_length: 2048
 
 # Curriculum
 sampling_mode: gaussian   # baseline | gaussian

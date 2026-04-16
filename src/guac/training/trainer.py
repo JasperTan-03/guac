@@ -188,13 +188,21 @@ class GRPOTrainer:
         )
 
         # ------------------------------------------------------------------
-        # Processor
-        # TODO: adjust trust_remote_code and padding_side for VLMs other than Qwen2-VL.
+        # Processor — image resolution cap
+        # Qwen2-VL downsamples images exceeding max_pixels before ViT
+        # encoding, bounding visual-token count and activation memory.
+        # Without this, outlier geometry diagrams (1604×440, ~3680 visual
+        # tokens) can OOM the teacher-forcing forward on a 48 GB A6000.
         # ------------------------------------------------------------------
+        processor_kwargs: Dict[str, Any] = {"trust_remote_code": True}
+        if hasattr(cfg.model, "max_pixels"):
+            processor_kwargs["max_pixels"] = int(cfg.model.max_pixels)
+        if hasattr(cfg.model, "min_pixels"):
+            processor_kwargs["min_pixels"] = int(cfg.model.min_pixels)
         logger.info("Loading processor from %s ...", cfg.model.name)
         self.processor = AutoProcessor.from_pretrained(
             cfg.model.name,
-            trust_remote_code=True,
+            **processor_kwargs,
         )
         if hasattr(self.processor, "tokenizer"):
             # Left-padding is required for correct generation with batch inference.
@@ -845,6 +853,21 @@ class GRPOTrainer:
             Scalar tensor: sum of log-probs over generated (non-masked)
             token positions.
         """
+        # Hard safety net: truncate if the sequence exceeds the
+        # configured max_seq_length.  This prevents OOM from edge-case
+        # combinations of large images + long generations that slip past
+        # the max_pixels cap.  Truncation only trims generated tokens
+        # (prompt positions are preserved).
+        max_seq = int(self.cfg.training.get("max_seq_length", 2048))
+        if input_ids.shape[1] > max_seq:
+            logger.warning(
+                "Sequence length %d exceeds max_seq_length=%d; truncating.",
+                input_ids.shape[1], max_seq,
+            )
+            input_ids = input_ids[:, :max_seq]
+            attention_mask = attention_mask[:, :max_seq]
+            labels = labels[:, :max_seq]
+
         with torch.amp.autocast(
             self.device.type,
             dtype=self._autocast_dtype,

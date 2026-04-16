@@ -18,4 +18,5 @@ accelerate launch \
     scripts/train.py \
     training.sampling_mode=baseline \
     training.gradient_accumulation_steps=1 \
+    training.batch_size=4 \
     "$@"

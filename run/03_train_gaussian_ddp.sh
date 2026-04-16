@@ -21,9 +21,12 @@ cd "$SCRIPT_DIR/.."
 source .venv/bin/activate
 
 echo "=== Phase 3: GRPO Training (Gaussian curriculum, 8x DDP) ==="
+# batch_size=4: with the max_pixels cap in conf/model/qwen2_vl_7b.yaml,
+# peak VRAM is ~28 GB per rank, leaving 20 GB headroom on 48 GB A6000s.
 accelerate launch \
     --config_file=accelerate_config.yaml \
     scripts/train.py \
     training.sampling_mode=gaussian \
     training.gradient_accumulation_steps=1 \
+    training.batch_size=4 \
     "$@"

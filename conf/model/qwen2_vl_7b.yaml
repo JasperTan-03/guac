@@ -1,6 +1,16 @@
 name: Qwen/Qwen2-VL-7B-Instruct
 dtype: bfloat16
 
+# Vision resolution cap.  Qwen2-VL's processor downsamples images whose
+# pixel count exceeds max_pixels (preserving aspect ratio) before ViT
+# encoding.  The dataset has outlier geometry diagrams at 1604×440
+# (~706K pixels, ~3680 visual tokens) that spike activation memory and
+# OOM after ~200 steps on a 48 GB A6000.  401408 = 512 × 28 × 28 caps
+# visual tokens at ~2048 (→ ~1024 after the 2× spatial merge), bounding
+# peak VRAM while keeping enough resolution for geometry labels & angles.
+max_pixels: 401408    # 512 * 28 * 28
+min_pixels: 3136      # 4 * 28 * 28  (Qwen2-VL default lower bound)
+
 lora:
   r: 8
   lora_alpha: 16
