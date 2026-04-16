@@ -7,7 +7,10 @@ annotated files to ``{cfg.data.scored_dir}/{stem}.jsonl``.
 Each output record carries these difficulty fields:
   - ``difficulty``              — continuous float in (0, 1), or null on failure
   - ``difficulty_integer``      — argmax integer (diagnostic)
-  - ``difficulty_probs``        — per-digit softmax probs over the rubric range
+  - ``difficulty_probs``        — softmax probs over the supported single-token
+                                  digit labels (``"1"`` through
+                                  ``str(min(score_max, 9))``) — not necessarily
+                                  every integer in ``1..score_max``
   - ``difficulty_raw_response`` — raw VLM output string
   - ``difficulty_parse_error``  — bool
 
@@ -28,7 +31,11 @@ Usage::
     python scripts/judge_difficulty.py
     python scripts/judge_difficulty.py judge.batch_size=16
     python scripts/judge_difficulty.py judge.splits=[val]
-    python scripts/judge_difficulty.py judge=vllm_coding
+    # Swap rubric inline (no new yaml needed):
+    python scripts/judge_difficulty.py 'judge.system_prompt="<your rubric>"' judge.score_max=5
+    # Or author a sibling yaml under conf/judge/ (e.g. conf/judge/vllm_coding.yaml)
+    # and reference it by group name:
+    #   python scripts/judge_difficulty.py judge=vllm_coding
 """
 
 import logging

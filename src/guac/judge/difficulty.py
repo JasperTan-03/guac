@@ -7,9 +7,12 @@ expected score:
 
     E[score] = sum_{i=1..min(score_max, 9)}  i * softmax(logp_i)
 
-``difficulty`` is then ``E[score] / score_max``, a float in roughly
-``(0.1/score_max, 0.9)`` — dense and continuous rather than bucketed to 10
-discrete values. The argmax integer is still stored as ``difficulty_integer``
+``difficulty`` is then ``E[score] / score_max``, a float in approximately
+``(1/score_max, min(score_max, 9)/score_max)`` — dense and continuous rather
+than bucketed to ``score_max`` discrete values. When ``score_max == 10``, the
+top end caps at ``0.9`` because the expectation excludes the ``"10"`` token
+(two-token in Qwen2; its first token is ``"1"`` and would collide with the
+``i=1`` bucket). The argmax integer is still stored as ``difficulty_integer``
 for diagnostics.
 
 The rubric text, score range, top-k, and split list are all read from
@@ -37,8 +40,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Output parser (argmax from raw text — kept for diagnostics + text fallback)
 # ---------------------------------------------------------------------------
-def parse_difficulty_score(response: str) -> Optional[int]:
-    """Extract the first integer in [1, 10] from a raw VLM response string.
+def parse_difficulty_score(response: str, score_max: int = 10) -> Optional[int]:
+    """Extract the first integer in ``[1, score_max]`` from a raw VLM response.
 
     Handles common malformed patterns such as:
 
@@ -48,11 +51,18 @@ def parse_difficulty_score(response: str) -> Optional[int]:
     - ``"7.5"``            -> 7
     - Multi-line output    -> strip and take first numeric token
 
+    The upper bound is configurable so the parser stays consistent with the
+    active rubric. For a ``score_max=5`` rubric, a model output of ``"7"`` is
+    out-of-range and will be rejected (returns ``None``) rather than silently
+    producing a normalized ``difficulty > 1.0`` downstream.
+
     Args:
         response: Raw string returned by the VLM.
+        score_max: Rubric upper bound (inclusive). Defaults to 10.
 
     Returns:
-        An integer in [1, 10] if one can be reliably extracted, else None.
+        An integer in ``[1, score_max]`` if one can be reliably extracted,
+        else ``None``.
     """
     if not response:
         return None
@@ -67,7 +77,7 @@ def parse_difficulty_score(response: str) -> Optional[int]:
 
     for match in matches:
         value = int(match)
-        if 1 <= value <= 10:
+        if 1 <= value <= score_max:
             return value
 
     return None
@@ -345,7 +355,7 @@ class DifficultyJudge:
                 expectation, probs = compute_continuous_difficulty(
                     lp0, self._tokenizer, self._score_max
                 )
-                score_int = parse_difficulty_score(raw_response)
+                score_int = parse_difficulty_score(raw_response, self._score_max)
 
                 if expectation is not None:
                     difficulty: Optional[float] = expectation / self._score_max
