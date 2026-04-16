@@ -9,6 +9,49 @@ max_model_len: 4096
 batch_size: 32
 temperature: 0.0
 max_tokens: 16
+logprobs_k: 20
 
 # Checkpointing (rows between checkpoint writes)
 checkpoint_interval: 500
+
+# Splits to score — each must exist as {cfg.data.processed_dir}/{stem}.jsonl
+splits: [train, val, test]
+
+# Data-parallel judging. Run N copies of the script with different ranks:
+# each rank scores records where (index % world_size == rank) and writes to
+# {scored_dir}/{stem}.part{rank}-of-{world_size}.jsonl. Merge afterwards with
+# scripts/merge_judge_shards.py. See run/02_judge_difficulty_ddp.sh for an
+# 8-GPU launcher. world_size=1 (default) is plain single-GPU judging.
+world_size: 1
+rank: 0
+
+# Rubric upper bound. Used for:
+#   - normalization:  difficulty = E[score] / score_max
+#   - which digit tokens to read: "1".."{min(score_max, 9)}" (vocab single-token digits)
+# For Qwen2, "10" is two tokens — we skip it; the 1.0 bucket is empty in practice.
+score_max: 10
+
+# Judging rubric. Swap this (or override via `judge.system_prompt=...`) to judge
+# datasets outside the math domain. Instruct the model to reply with a single
+# integer in [1, score_max].
+system_prompt: |
+  You are a mathematics subject matter expert and competition problem classifier.
+  Your task is to assess the difficulty of the following mathematical problem on a continuous scale from 1 to 10
+  using the Art of Problem Solving (AoPS) difficulty rubric:
+
+  AoPS Difficulty Scale:
+    1 - Trivial arithmetic or basic definitions (e.g., 2+2, naming a shape)
+    2 - Elementary school competition level (e.g., simple word problems, basic fractions)
+    3 - Middle school competition level (e.g., AMC 8 easy, MATHCOUNTS Sprint easy)
+    4 - AMC 8 hard / AMC 10 easy (e.g., basic algebra, geometry, number theory)
+    5 - AMC 10 mid / AMC 12 easy (e.g., intermediate algebra, combinatorics intro)
+    6 - AMC 10 hard / AMC 12 mid (e.g., coordinate geometry, modular arithmetic)
+    7 - AMC 12 hard / AIME easy (e.g., complex numbers, advanced combinatorics)
+    8 - AIME mid (e.g., multi-step proofs, advanced number theory, 3D geometry)
+    9 - AIME hard / USAMO easy (e.g., olympiad-level proofs, elegant constructions)
+    10 - USAMO/Putnam hard (e.g., research-adjacent, highly non-trivial proofs)
+
+  Instructions:
+  - Carefully read the problem text and examine any provided image.
+  - Consider the mathematical concepts required, the number of steps, and the creativity needed.
+  - Respond with ONLY a single continuous number between 1 and 10 (e.g., 5.5, 7.2). No explanation, no punctuation, no extra text.
