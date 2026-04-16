@@ -16,23 +16,31 @@ log_steps: 10
 max_new_tokens: 128
 temperature: 1.0   # higher → more rollout diversity → richer reward signal
 top_p: 0.9
+# Hard safety net: if prompt + rollout exceeds this after tokenization,
+# truncate the generation so the forward pass stays bounded.  Catches
+# edge cases where max_pixels doesn't fully prevent long sequences.
+max_seq_length: 2048
 
 # Curriculum
 sampling_mode: gaussian   # baseline | gaussian
 # T_init starts at d_min so the cold-start draws from the easiest
-# allowed bucket.  AdaRFT (Shi et al. 2025, Fig. 4) shows that starting
-# in the middle of the difficulty range produces an early reward
-# trajectory near 0 — which in a binary-reward setting collapses every
-# group to all-zeros and stalls training.  Starting easy lets the model
-# bootstrap a non-zero success rate; the tanh update then ramps T up
-# toward the productive-struggle zone (reward ≈ β = 0.5).
-T_init: 0.3
+# problems in the dataset (ScienceQA trivia at d=0.1: "What is the
+# capital of Washington?" etc.).  The base Qwen2-VL can actually answer
+# these, giving a non-zero reward bootstrap.  The tanh update then
+# ramps T up toward the productive-struggle zone (reward ≈ β = 0.5).
+#
+# IMPORTANT: the scored dataset has d ∈ {0.1, 0.2, 0.3, 0.4, …, 0.7}.
+# Setting d_min=0.3 (the old default) cuts off 52% of the easy data
+# and forces a cold model onto geometry problems it cannot solve at all
+# — producing all-zero rewards on every step.  d_min=0.1 is the true
+# dataset floor.
+T_init: 0.1
 eta: 0.05
 alpha: 2.0
 beta: 0.5
 sigma: 0.15
-d_min: 0.3   # floor prevents T collapsing to trivial problems (all-correct groups)
-d_max: 1.0
+d_min: 0.1   # true dataset floor — ScienceQA trivia lives here
+d_max: 0.7   # true dataset ceiling — no problems above 0.7 exist
 
 # GRPO / KL.  kl_coeff=0.0 disables the reference-model KL term.
 # NOTE: with binary rewards and a cold policy, "flat groups" (every

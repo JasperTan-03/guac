@@ -34,7 +34,12 @@ def main(cfg: DictConfig) -> None:
     Args:
         cfg: Hydra-composed DictConfig from ``conf/config.yaml``.
     """
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)
+    # ``accelerate launch`` sets LOCAL_RANK per process and manages
+    # CUDA_VISIBLE_DEVICES itself — overriding it here would collapse
+    # all 8 ranks onto the same GPU.  Only pin to cfg.gpu_id when
+    # invoked as plain ``python scripts/train.py``.
+    if "LOCAL_RANK" not in os.environ:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)
 
     log.info(
         "Starting GRPO training | model=%s | steps=%d | sampling_mode=%s | gpu_id=%s",

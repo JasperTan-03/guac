@@ -18,7 +18,9 @@ source .venv/bin/activate
 uv pip install -e ".[dev]"
 ```
 
-**GPU constraint**: All scripts pin to GPU 0 by default. The `gpu_id` value in `conf/config.yaml` is set at the top of each script via `os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)`.
+**GPU constraint** (single-GPU launch): scripts pin to GPU 0 by default. The `gpu_id` value in `conf/config.yaml` is set at the top of each script via `os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)`.
+
+**Multi-GPU launch**: `bash run/03_train_gaussian_ddp.sh` wraps `accelerate launch --config_file=accelerate_config.yaml scripts/train.py ...`. In that path, accelerate sets `LOCAL_RANK` and manages device assignment itself; `scripts/train.py` only applies the `cfg.gpu_id` override when `LOCAL_RANK` is absent.
 
 Lint before committing:
 
@@ -30,10 +32,11 @@ Lint before committing:
 ## Running the Pipeline
 
 ```bash
-bash run/01_prepare_data.sh           # loads all splits → data/raw/ + data/processed/
-bash run/02_judge_difficulty.sh       # scores all splits → data/scored/
-bash run/03_train_gaussian.sh         # GRPO training → checkpoints/
-bash run/04_evaluate.sh               # eval → results/eval_results.json
+bash run/01_prepare_data.sh            # loads all splits → data/raw/ + data/processed/
+bash run/02_judge_difficulty.sh        # scores all splits → data/scored/
+bash run/03_train_gaussian.sh          # single-GPU GRPO training → checkpoints/
+bash run/03_train_gaussian_ddp.sh      # 8x DDP via accelerate → checkpoints/
+bash run/04_evaluate.sh                # eval → results/eval_results.json
 ```
 
 Scripts accept Hydra overrides appended directly:

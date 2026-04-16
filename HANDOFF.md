@@ -207,7 +207,7 @@ bash run/03_train_baseline.sh
 - Logs to MLflow every 10 steps
 - Saves LoRA checkpoints every 500 steps → `checkpoints/step_N/`
 - Final checkpoint → `checkpoints/final/`
-- **GPU required:** Yes (1 GPU, ~30 GB VRAM for model + LoRA + optimizer + activations)
+- **GPU required:** Yes (1 GPU, ~23 GB VRAM with the `max_pixels` cap; ~28 GB with `batch_size=4`)
 
 The two sampling modes are the experiment:
 
@@ -419,9 +419,11 @@ Three bugs in `_compute_batch_kl()` (the KL penalty path). These are dormant whe
 → The `conf/data/default.yaml` file is missing. Make sure you have the latest code.
 
 **`CUDA out of memory` during training**
-→ Reduce `batch_size` to 1 or `group_size` to 2:
+→ The `max_pixels` cap in `conf/model/qwen2_vl_7b.yaml` (default 401408 = 512×28×28) prevents the largest images from blowing up activation memory.  If you still OOM, reduce `batch_size` to 1 or `group_size` to 2, or lower `max_pixels`:
 ```bash
 bash run/03_train_gaussian.sh training.batch_size=1 training.group_size=2
+# Or lower image resolution further:
+bash run/03_train_gaussian.sh model.max_pixels=200704
 ```
 
 **`CUDA out of memory` during judging**

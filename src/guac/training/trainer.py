@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlflow
 import torch
 import torch.nn.functional as F
+from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoModelForVision2Seq, AutoProcessor, get_cosine_schedule_with_warmup
@@ -114,13 +115,33 @@ class GRPOTrainer:
         tcfg = cfg.training
 
         # ------------------------------------------------------------------
-        # Device
+        # Accelerator / device / rank
         # ------------------------------------------------------------------
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # mixed_precision="no" because bf16 weights + manual autocast are
+        # already managed by this class (see self._autocast_* below).
+        # Letting accelerate layer its own bf16 autocast on top would
+        # double-cast the policy forward pass.
+        #
+        # cpu=True when no CUDA is available: on Apple Silicon Macs,
+        # accelerate detects MPS and falls back to single-process mode
+        # even when RANK/WORLD_SIZE env vars are set.  Forcing CPU lets
+        # the gloo backend handle multi-process DDP in the smoke tests.
+        # On GPU boxes, CUDA is available and cpu=False (the default).
+        _force_cpu = not torch.cuda.is_available()
+        self.accelerator = Accelerator(mixed_precision="no", cpu=_force_cpu)
+        self.device = self.accelerator.device
+        self.is_main: bool = self.accelerator.is_main_process
+        self.rank: int = self.accelerator.process_index
+        self.world_size: int = self.accelerator.num_processes
         if self.device.type != "cuda":
             logger.warning(
                 "No CUDA device found. Training on CPU will be extremely slow "
                 "and is not recommended for production runs."
+            )
+        if self.world_size > 1:
+            logger.info(
+                "Distributed training detected: rank=%d/%d device=%s",
+                self.rank, self.world_size, self.device,
             )
 
         # ------------------------------------------------------------------
@@ -168,16 +189,27 @@ class GRPOTrainer:
             difficulties=difficulties,
             mode=str(tcfg.sampling_mode),
             sigma=float(tcfg.sigma),
+            seed=int(cfg.get("seed", 42)),
+            rank=self.rank,
+            world_size=self.world_size,
         )
 
         # ------------------------------------------------------------------
-        # Processor
-        # TODO: adjust trust_remote_code and padding_side for VLMs other than Qwen2-VL.
+        # Processor — image resolution cap
+        # Qwen2-VL downsamples images exceeding max_pixels before ViT
+        # encoding, bounding visual-token count and activation memory.
+        # Without this, outlier geometry diagrams (1604×440, ~3680 visual
+        # tokens) can OOM the teacher-forcing forward on a 48 GB A6000.
         # ------------------------------------------------------------------
+        processor_kwargs: Dict[str, Any] = {"trust_remote_code": True}
+        if hasattr(cfg.model, "max_pixels"):
+            processor_kwargs["max_pixels"] = int(cfg.model.max_pixels)
+        if hasattr(cfg.model, "min_pixels"):
+            processor_kwargs["min_pixels"] = int(cfg.model.min_pixels)
         logger.info("Loading processor from %s ...", cfg.model.name)
         self.processor = AutoProcessor.from_pretrained(
             cfg.model.name,
-            trust_remote_code=True,
+            **processor_kwargs,
         )
         if hasattr(self.processor, "tokenizer"):
             # Left-padding is required for correct generation with batch inference.
@@ -231,7 +263,8 @@ class GRPOTrainer:
             task_type=TaskType.CAUSAL_LM,
         )
         self.model = get_peft_model(base_model, lora_config)
-        self.model.print_trainable_parameters()
+        if self.is_main:
+            self.model.print_trainable_parameters()
 
         # ------------------------------------------------------------------
         # Optional frozen reference model for KL penalty
@@ -272,16 +305,33 @@ class GRPOTrainer:
         )
 
         # ------------------------------------------------------------------
-        # MLflow
+        # Distributed wrapping
         # ------------------------------------------------------------------
-        mlflow.set_tracking_uri(str(tcfg.mlflow_tracking_uri))
-        mlflow.set_experiment(str(tcfg.mlflow_experiment))
-        self._mlflow_run = mlflow.start_run()
-        # Log the full resolved config as flat params.
-        mlflow.log_params(OmegaConf.to_container(cfg, resolve=True))
-        logger.info(
-            "MLflow run started: %s", self._mlflow_run.info.run_id
+        # Under DDP this returns a DistributedDataParallel wrapper.  The
+        # wrapper's ``forward`` triggers gradient all-reduce at
+        # ``backward`` time.  In single-process (rank=0, world_size=1)
+        # this is a no-op passthrough.  The reference model (if any) is
+        # intentionally NOT prepared — it's frozen, no optimizer, no
+        # backward, so wrapping it would just waste registering unused
+        # reducers.
+        self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
+            self.model, self.optimizer, self.scheduler,
         )
+
+        # ------------------------------------------------------------------
+        # MLflow (rank 0 only — other ranks leave _mlflow_run as None so
+        # the logging guards below short-circuit cleanly).
+        # ------------------------------------------------------------------
+        self._mlflow_run = None
+        if self.is_main:
+            mlflow.set_tracking_uri(str(tcfg.mlflow_tracking_uri))
+            mlflow.set_experiment(str(tcfg.mlflow_experiment))
+            self._mlflow_run = mlflow.start_run()
+            # Log the full resolved config as flat params.
+            mlflow.log_params(OmegaConf.to_container(cfg, resolve=True))
+            logger.info(
+                "MLflow run started: %s", self._mlflow_run.info.run_id
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -329,12 +379,6 @@ class GRPOTrainer:
         running_reward = 0.0
         running_informative_groups = 0
         running_flat_groups = 0
-        # Tracks whether any informative micro-step contributed gradient in
-        # the current grad_accum window.  When every micro-step in the
-        # window is flat, we advance global_step and the curriculum anyway
-        # so the loop always terminates at num_train_steps, but we skip
-        # optimizer.step (there's nothing to update).
-        had_gradient_this_window = False
 
         self.model.train()
         self.optimizer.zero_grad()
@@ -395,12 +439,17 @@ class GRPOTrainer:
                 )
 
                 # ----------------------------------------------------------
-                # Step 2 (cont.): Rollout generation — no_grad, eval mode
+                # Step 2 (cont.): Rollout generation — no_grad, eval mode.
+                # Under DDP, ``self.model`` is a DistributedDataParallel
+                # wrapper that only exposes ``forward()`` — ``generate()``
+                # lives on the inner module.  ``unwrap_model`` is a no-op
+                # in single-process mode.
                 # ----------------------------------------------------------
                 self.model.eval()
+                gen_model = self.accelerator.unwrap_model(self.model)
                 with torch.no_grad():
                     for _ in range(group_size):
-                        gen_out = self.model.generate(
+                        gen_out = gen_model.generate(
                             **prompt_inputs,
                             max_new_tokens=max_new_tokens,
                             do_sample=True,
@@ -506,6 +555,29 @@ class GRPOTrainer:
                 if batch_raw_rewards else 0.0
             )
 
+            # ----------------------------------------------------------
+            # DDP safety: EVERY rank must call backward() on EVERY
+            # micro-step, because DDP's gradient allreduce fires inside
+            # backward() and deadlocks if any rank skips it.  When all
+            # groups on a rank are flat (advantages = 0), we synthesize a
+            # differentiable-zero loss that touches every trainable
+            # parameter — contributing zero gradient while keeping DDP's
+            # NCCL sequence numbers in sync across all 8 ranks.
+            #
+            # IMPORTANT: earlier versions used a user-initiated
+            # accelerator.reduce() "has-signal" collective here to let
+            # all ranks coordinate whether to skip backward.  That
+            # CAUSED the NCCL timeout (SeqNum=98) because the extra
+            # collective interleaved with DDP's internal gradient
+            # allreduce, drifting sequence numbers.  The fix is to always
+            # backward — no user collectives needed.
+            # ----------------------------------------------------------
+            # Ensure train mode before backward: the generation phase
+            # leaves the model in eval mode; if all groups were flat,
+            # self.model.train() was never called back.  DDP backward
+            # hooks must see consistent mode across ranks.
+            self.model.train()
+
             if all_log_probs:
                 lp_tensor = torch.stack(all_log_probs)        # (N,)
                 adv_tensor = torch.tensor(
@@ -520,57 +592,93 @@ class GRPOTrainer:
                     kl_total = self._compute_batch_kl(kl_data)
                     loss = loss + self.kl_coeff * kl_total
 
-                # ------------------------------------------------------
-                # Step 7: Gradient accumulation
-                # ------------------------------------------------------
                 scaled_loss = loss / grad_accum
-                scaled_loss.backward()
+                self.accelerator.backward(scaled_loss)
                 running_loss += loss.item()
-                had_gradient_this_window = True
             else:
-                # Every group in this micro-step was flat (all rollouts got
-                # the same reward).  The GRPO term would be exactly 0.  We
-                # still advance micro_step and the curriculum so the loop
-                # makes forward progress toward num_train_steps — otherwise
-                # a persistently cold policy would spin forever.
-                logger.warning(
-                    "All %d groups were flat this micro-step (rewards "
-                    "collapsed to a single value); skipping backward. "
-                    "If this persists, check reward shaping or curriculum.",
-                    flat_groups,
-                )
+                # All groups on this rank were flat.  We still need to
+                # call backward so DDP's gradient allreduce fires and
+                # ranks stay in sync.  The zero-gradient contribution
+                # from this rank correctly dilutes the global gradient
+                # average — flat ranks genuinely had nothing to contribute.
+                trainable = [
+                    p for p in self.model.parameters() if p.requires_grad
+                ]
+                if trainable:
+                    dummy = torch.stack([p.sum() for p in trainable]).sum() * 0.0
+                else:  # pragma: no cover — LoRA always has trainable params
+                    dummy = torch.zeros((), device=self.device, requires_grad=True)
+                self.accelerator.backward(dummy / grad_accum)
+
+                if flat_groups > 0 and (micro_step <= 2 or micro_step % (log_steps * grad_accum) == 0):
+                    logger.warning(
+                        "All %d groups on rank %d were flat (micro_step=%d); "
+                        "backward with zero gradient.",
+                        flat_groups, self.rank, micro_step,
+                    )
 
             micro_step += 1
 
             # ----------------------------------------------------------
-            # Optimizer step — fire every grad_accum micro-steps.
-            # When every micro-step in the window was flat, skip
-            # optimizer.step (no gradient to apply) but still advance the
-            # scheduler, curriculum, and global_step so training always
-            # terminates cleanly at num_train_steps.
+            # Optimizer step — fires every grad_accum micro-steps.
+            # Always steps the optimizer (even if all gradients were
+            # zero from flat groups) so DDP stays in a clean state and
+            # the scheduler/curriculum advance deterministically.
             # ----------------------------------------------------------
             if micro_step % grad_accum == 0:
-                if had_gradient_this_window:
-                    torch.nn.utils.clip_grad_norm_(
-                        filter(lambda p: p.requires_grad, self.model.parameters()),
-                        max_grad_norm,
-                    )
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
+                self.accelerator.clip_grad_norm_(
+                    self.model.parameters(), max_grad_norm,
+                )
+                self.optimizer.step()
+                self.optimizer.zero_grad()
                 self.scheduler.step()
                 global_step += 1
 
-                # Step 8: Curriculum update (exactly once per optimizer step).
+                # ------------------------------------------------------
+                # Step 8: Curriculum update.
+                #
+                # IMPORTANT: NO user-initiated collectives (reduce,
+                # all_reduce, gather, barrier) in the per-step hot path.
+                # Any accelerator.reduce() call here interleaves with
+                # DDP's internal gradient allreduce on the same NCCL
+                # process group, causing sequence-number drift and an
+                # eventual NCCL timeout (the SeqNum=77/98 hangs seen in
+                # prior runs).
+                #
+                # Each rank computes R_avg from its own local batch and
+                # updates T independently.  Since all ranks sample from
+                # the same difficulty distribution with similar T, the
+                # per-rank R_avg values are close and T drift across
+                # ranks is bounded by eta=0.05 per step.  For gaussian
+                # mode (the primary use case), the stochastic per-rank
+                # RNG already dominates any T-drift effect.  For
+                # baseline mode the drift could cause slight overlap in
+                # rank slices after many steps — acceptable tradeoff vs
+                # deadlocking.
+                # ------------------------------------------------------
                 R_avg = running_reward / grad_accum
                 self.curriculum.update(R_avg)
 
-                # Step 9: Logging.
-                total_groups = running_informative_groups + running_flat_groups
+                # ------------------------------------------------------
+                # Step 9: Logging — rank 0 logs its local metrics.
+                # With 8 ranks × batch_size=4 × group_size=4 = 128
+                # rollouts per step, rank 0's 16-rollout slice is
+                # representative.  This avoids the NCCL-interleaving
+                # hazard of cross-rank metric aggregation.
+                # ------------------------------------------------------
+                avg_loss = running_loss / grad_accum
+                total_flat = running_flat_groups
+                total_info = running_informative_groups
+                total_groups = total_info + total_flat
                 flat_frac = (
-                    running_flat_groups / total_groups if total_groups > 0 else 0.0
+                    total_flat / total_groups if total_groups > 0 else 0.0
                 )
-                if global_step % log_steps == 0:
-                    avg_loss = running_loss / grad_accum
+                # Log at log_steps intervals AND always on step 1 so the
+                # first model output is visible immediately for debugging.
+                should_log = (
+                    global_step % log_steps == 0 or global_step == 1
+                )
+                if should_log and self.is_main:
                     current_lr = self.scheduler.get_last_lr()[0]
                     logger.info(
                         "step=%d | loss=%.4f | reward=%.4f | T=%.4f | lr=%.2e "
@@ -580,7 +688,7 @@ class GRPOTrainer:
                         R_avg,
                         self.curriculum.T,
                         current_lr,
-                        running_flat_groups,
+                        total_flat,
                         total_groups,
                     )
                     if _log_sample is not None:
@@ -597,14 +705,19 @@ class GRPOTrainer:
                             "curriculum/T": self.curriculum.T,
                             "train/learning_rate": current_lr,
                             "train/flat_groups_frac": flat_frac,
-                            "train/informative_groups": running_informative_groups,
-                            "train/flat_groups": running_flat_groups,
+                            "train/informative_groups": total_info,
+                            "train/flat_groups": total_flat,
                         },
                         step=global_step,
                     )
 
-                # Step 10: Checkpoint.
-                if global_step % save_steps == 0:
+                # Step 10: Checkpoint — rank 0 only.
+                # NO barrier (wait_for_everyone) here — even an
+                # infrequent barrier is a user-initiated collective that
+                # can interleave with DDP's gradient allreduce.
+                # optimizer.step() has already completed synchronously on
+                # all ranks, so the weights being saved are consistent.
+                if global_step % save_steps == 0 and self.is_main:
                     ckpt_path = self._save_checkpoint(global_step)
                     mlflow.log_artifact(ckpt_path)
 
@@ -613,7 +726,6 @@ class GRPOTrainer:
                 running_reward = 0.0
                 running_informative_groups = 0
                 running_flat_groups = 0
-                had_gradient_this_window = False
 
             # Free fragmented GPU memory after each micro-step.
             if self.device.type == "cuda":
@@ -623,15 +735,27 @@ class GRPOTrainer:
                 break
 
         # ------------------------------------------------------------------
-        # Final checkpoint
+        # Final checkpoint — rank 0 only.
+        # No barrier here: wait_for_everyone uses
+        # torch.distributed.barrier(device_ids=[...]) which fails on
+        # gloo+CPU and on some NCCL configurations.  All ranks exit the
+        # while-loop at the same global_step, so rank 0's weights are
+        # already up-to-date from the last synchronized optimizer.step.
         # ------------------------------------------------------------------
-        final_dir = self.output_dir / "final"
-        final_dir.mkdir(parents=True, exist_ok=True)
-        self.model.save_pretrained(str(final_dir))
-        self.processor.save_pretrained(str(final_dir))
-        logger.info("Training complete. Final checkpoint saved to %s", final_dir)
-        mlflow.log_artifact(str(final_dir))
-        mlflow.end_run()
+        if self.is_main:
+            final_dir = self.output_dir / "final"
+            final_dir.mkdir(parents=True, exist_ok=True)
+            # unwrap_model so the saved adapter is plain PEFT weights,
+            # not a DDP-wrapped state_dict.
+            self.accelerator.unwrap_model(self.model).save_pretrained(
+                str(final_dir)
+            )
+            self.processor.save_pretrained(str(final_dir))
+            logger.info(
+                "Training complete. Final checkpoint saved to %s", final_dir,
+            )
+            mlflow.log_artifact(str(final_dir))
+            mlflow.end_run()
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -721,6 +845,21 @@ class GRPOTrainer:
             Scalar tensor: sum of log-probs over generated (non-masked)
             token positions.
         """
+        # Hard safety net: truncate if the sequence exceeds the
+        # configured max_seq_length.  This prevents OOM from edge-case
+        # combinations of large images + long generations that slip past
+        # the max_pixels cap.  Truncation only trims generated tokens
+        # (prompt positions are preserved).
+        max_seq = int(self.cfg.training.get("max_seq_length", 2048))
+        if input_ids.shape[1] > max_seq:
+            logger.warning(
+                "Sequence length %d exceeds max_seq_length=%d; truncating.",
+                input_ids.shape[1], max_seq,
+            )
+            input_ids = input_ids[:, :max_seq]
+            attention_mask = attention_mask[:, :max_seq]
+            labels = labels[:, :max_seq]
+
         with torch.amp.autocast(
             self.device.type,
             dtype=self._autocast_dtype,
@@ -824,7 +963,11 @@ class GRPOTrainer:
         """
         ckpt_dir = self.output_dir / f"step_{step}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        self.model.save_pretrained(str(ckpt_dir))
+        # unwrap_model so the adapter directory contains plain PEFT
+        # weights, not a DDP-wrapped state_dict.  No-op single-process.
+        self.accelerator.unwrap_model(self.model).save_pretrained(
+            str(ckpt_dir)
+        )
         self.processor.save_pretrained(str(ckpt_dir))
         logger.info("Checkpoint saved to %s", ckpt_dir)
         return str(ckpt_dir)
