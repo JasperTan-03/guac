@@ -121,7 +121,14 @@ class GRPOTrainer:
         # already managed by this class (see self._autocast_* below).
         # Letting accelerate layer its own bf16 autocast on top would
         # double-cast the policy forward pass.
-        self.accelerator = Accelerator(mixed_precision="no")
+        #
+        # cpu=True when no CUDA is available: on Apple Silicon Macs,
+        # accelerate detects MPS and falls back to single-process mode
+        # even when RANK/WORLD_SIZE env vars are set.  Forcing CPU lets
+        # the gloo backend handle multi-process DDP in the smoke tests.
+        # On GPU boxes, CUDA is available and cpu=False (the default).
+        _force_cpu = not torch.cuda.is_available()
+        self.accelerator = Accelerator(mixed_precision="no", cpu=_force_cpu)
         self.device = self.accelerator.device
         self.is_main: bool = self.accelerator.is_main_process
         self.rank: int = self.accelerator.process_index
@@ -565,6 +572,12 @@ class GRPOTrainer:
             # allreduce, drifting sequence numbers.  The fix is to always
             # backward — no user collectives needed.
             # ----------------------------------------------------------
+            # Ensure train mode before backward: the generation phase
+            # leaves the model in eval mode; if all groups were flat,
+            # self.model.train() was never called back.  DDP backward
+            # hooks must see consistent mode across ranks.
+            self.model.train()
+
             if all_log_probs:
                 lp_tensor = torch.stack(all_log_probs)        # (N,)
                 adv_tensor = torch.tensor(
@@ -699,14 +712,14 @@ class GRPOTrainer:
                     )
 
                 # Step 10: Checkpoint — rank 0 only.
-                # wait_for_everyone is safe here because it fires
-                # infrequently (every save_steps=500) and all ranks are
-                # at the same logical point in the loop.
-                if global_step % save_steps == 0:
-                    self.accelerator.wait_for_everyone()
-                    if self.is_main:
-                        ckpt_path = self._save_checkpoint(global_step)
-                        mlflow.log_artifact(ckpt_path)
+                # NO barrier (wait_for_everyone) here — even an
+                # infrequent barrier is a user-initiated collective that
+                # can interleave with DDP's gradient allreduce.
+                # optimizer.step() has already completed synchronously on
+                # all ranks, so the weights being saved are consistent.
+                if global_step % save_steps == 0 and self.is_main:
+                    ckpt_path = self._save_checkpoint(global_step)
+                    mlflow.log_artifact(ckpt_path)
 
                 # Reset running accumulators for next optimizer step.
                 running_loss = 0.0
@@ -722,10 +735,13 @@ class GRPOTrainer:
                 break
 
         # ------------------------------------------------------------------
-        # Final checkpoint — rank 0 only.  Barrier first so every rank
-        # has exited the training loop before we serialise weights.
+        # Final checkpoint — rank 0 only.
+        # No barrier here: wait_for_everyone uses
+        # torch.distributed.barrier(device_ids=[...]) which fails on
+        # gloo+CPU and on some NCCL configurations.  All ranks exit the
+        # while-loop at the same global_step, so rank 0's weights are
+        # already up-to-date from the last synchronized optimizer.step.
         # ------------------------------------------------------------------
-        self.accelerator.wait_for_everyone()
         if self.is_main:
             final_dir = self.output_dir / "final"
             final_dir.mkdir(parents=True, exist_ok=True)
