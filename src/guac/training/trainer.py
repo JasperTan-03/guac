@@ -597,12 +597,11 @@ class GRPOTrainer:
                     dummy = torch.zeros((), device=self.device, requires_grad=True)
                 self.accelerator.backward(dummy / grad_accum)
 
-                if flat_groups > 0:
+                if flat_groups > 0 and (micro_step <= 2 or micro_step % (log_steps * grad_accum) == 0):
                     logger.warning(
-                        "All %d groups on rank %d were flat this micro-step; "
-                        "backward with zero gradient. "
-                        "If this persists, check reward shaping or curriculum.",
-                        flat_groups, self.rank,
+                        "All %d groups on rank %d were flat (micro_step=%d); "
+                        "backward with zero gradient.",
+                        flat_groups, self.rank, micro_step,
                     )
 
             micro_step += 1
@@ -669,7 +668,12 @@ class GRPOTrainer:
                 flat_frac = (
                     total_flat / total_groups if total_groups > 0 else 0.0
                 )
-                if global_step % log_steps == 0 and self.is_main:
+                # Log at log_steps intervals AND always on step 1 so the
+                # first model output is visible immediately for debugging.
+                should_log = (
+                    global_step % log_steps == 0 or global_step == 1
+                )
+                if should_log and self.is_main:
                     current_lr = self.scheduler.get_last_lr()[0]
                     logger.info(
                         "step=%d | loss=%.4f | reward=%.4f | T=%.4f | lr=%.2e "
