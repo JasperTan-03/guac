@@ -372,12 +372,6 @@ class GRPOTrainer:
         running_reward = 0.0
         running_informative_groups = 0
         running_flat_groups = 0
-        # Tracks whether any informative micro-step contributed gradient in
-        # the current grad_accum window.  When every micro-step in the
-        # window is flat, we advance global_step and the curriculum anyway
-        # so the loop always terminates at num_train_steps, but we skip
-        # optimizer.step (there's nothing to update).
-        had_gradient_this_window = False
 
         self.model.train()
         self.optimizer.zero_grad()
@@ -555,22 +549,22 @@ class GRPOTrainer:
             )
 
             # ----------------------------------------------------------
-            # DDP safety: every rank must either call backward() together
-            # or skip it together.  If rank A does backward (firing DDP's
-            # gradient allreduce) while rank B does not, B hangs.  A cheap
-            # boolean all-reduce lets us make a unanimous decision.
+            # DDP safety: EVERY rank must call backward() on EVERY
+            # micro-step, because DDP's gradient allreduce fires inside
+            # backward() and deadlocks if any rank skips it.  When all
+            # groups on a rank are flat (advantages = 0), we synthesize a
+            # differentiable-zero loss that touches every trainable
+            # parameter — contributing zero gradient while keeping DDP's
+            # NCCL sequence numbers in sync across all 8 ranks.
+            #
+            # IMPORTANT: earlier versions used a user-initiated
+            # accelerator.reduce() "has-signal" collective here to let
+            # all ranks coordinate whether to skip backward.  That
+            # CAUSED the NCCL timeout (SeqNum=98) because the extra
+            # collective interleaved with DDP's internal gradient
+            # allreduce, drifting sequence numbers.  The fix is to always
+            # backward — no user collectives needed.
             # ----------------------------------------------------------
-            local_has_signal = torch.tensor(
-                1 if all_log_probs else 0,
-                device=self.device, dtype=torch.long,
-            )
-            if self.world_size > 1:
-                global_has_signal = self.accelerator.reduce(
-                    local_has_signal, reduction="sum",
-                ).item() > 0
-            else:
-                global_has_signal = bool(local_has_signal.item())
-
             if all_log_probs:
                 lp_tensor = torch.stack(all_log_probs)        # (N,)
                 adv_tensor = torch.tensor(
@@ -585,20 +579,15 @@ class GRPOTrainer:
                     kl_total = self._compute_batch_kl(kl_data)
                     loss = loss + self.kl_coeff * kl_total
 
-                # ------------------------------------------------------
-                # Step 7: Gradient accumulation
-                # ------------------------------------------------------
                 scaled_loss = loss / grad_accum
                 self.accelerator.backward(scaled_loss)
                 running_loss += loss.item()
-                had_gradient_this_window = True
-            elif global_has_signal:
-                # This rank is flat but at least one other rank has signal
-                # and is calling backward().  We MUST participate in DDP's
-                # gradient allreduce or we deadlock.  Synthesize a
-                # differentiable-zero loss that touches every trainable
-                # parameter, so DDP's reducers fire uniformly and we
-                # contribute exactly zero gradient.
+            else:
+                # All groups on this rank were flat.  We still need to
+                # call backward so DDP's gradient allreduce fires and
+                # ranks stay in sync.  The zero-gradient contribution
+                # from this rank correctly dilutes the global gradient
+                # average — flat ranks genuinely had nothing to contribute.
                 trainable = [
                     p for p in self.model.parameters() if p.requires_grad
                 ]
@@ -607,38 +596,29 @@ class GRPOTrainer:
                 else:  # pragma: no cover — LoRA always has trainable params
                     dummy = torch.zeros((), device=self.device, requires_grad=True)
                 self.accelerator.backward(dummy / grad_accum)
-                # running_loss stays at 0 for this micro-step — honest
-                # signal for MLflow (flat_groups_frac captures the collapse).
-                had_gradient_this_window = True
-            else:
-                # Every rank is flat this micro-step: skip backward
-                # entirely.  Advance micro_step/global_step below so the
-                # loop terminates at num_train_steps regardless.
-                logger.warning(
-                    "All %d groups on rank %d were flat this micro-step "
-                    "(and no other rank had signal); skipping backward. "
-                    "If this persists, check reward shaping or curriculum.",
-                    flat_groups, self.rank,
-                )
+
+                if flat_groups > 0:
+                    logger.warning(
+                        "All %d groups on rank %d were flat this micro-step; "
+                        "backward with zero gradient. "
+                        "If this persists, check reward shaping or curriculum.",
+                        flat_groups, self.rank,
+                    )
 
             micro_step += 1
 
             # ----------------------------------------------------------
-            # Optimizer step — fire every grad_accum micro-steps.
-            # When every micro-step in the window was flat, skip
-            # optimizer.step (no gradient to apply) but still advance the
-            # scheduler, curriculum, and global_step so training always
-            # terminates cleanly at num_train_steps.
+            # Optimizer step — fires every grad_accum micro-steps.
+            # Always steps the optimizer (even if all gradients were
+            # zero from flat groups) so DDP stays in a clean state and
+            # the scheduler/curriculum advance deterministically.
             # ----------------------------------------------------------
             if micro_step % grad_accum == 0:
-                if had_gradient_this_window:
-                    # accelerator.clip_grad_norm_ unwraps the DDP wrapper
-                    # and works correctly in single-process mode too.
-                    self.accelerator.clip_grad_norm_(
-                        self.model.parameters(), max_grad_norm,
-                    )
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
+                self.accelerator.clip_grad_norm_(
+                    self.model.parameters(), max_grad_norm,
+                )
+                self.optimizer.step()
+                self.optimizer.zero_grad()
                 self.scheduler.step()
                 global_step += 1
 
@@ -736,7 +716,6 @@ class GRPOTrainer:
                 running_reward = 0.0
                 running_informative_groups = 0
                 running_flat_groups = 0
-                had_gradient_this_window = False
 
             # Free fragmented GPU memory after each micro-step.
             if self.device.type == "cuda":

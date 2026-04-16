@@ -479,16 +479,19 @@ def test_trainer_skips_flat_groups_and_produces_nonzero_loss_on_varied(
 
 
 @_requires_tiny_model
-def test_trainer_all_flat_batch_terminates_without_optimizer_step(
+def test_trainer_all_flat_batch_terminates_and_logs_warning(
     tmp_path: Path, caplog
 ):
     """When every group in every micro-step is flat, training must
-    *terminate cleanly* at num_train_steps without ever firing the
-    optimizer.  This exercises the fix for the pre-existing infinite-loop
-    bug: before, global_step only advanced on informative micro-steps, so
-    a persistently cold / degenerate policy would spin forever.  Now the
-    trainer advances global_step + curriculum + scheduler on all-flat
-    micro-steps too and simply skips optimizer.step.
+    *terminate cleanly* at num_train_steps.  Under DDP, backward() is
+    always called (with a differentiable-zero dummy loss on flat ranks)
+    so that NCCL sequence numbers stay in sync.  Optimizer.step() fires
+    too — with all-zero gradients it's a no-op on model weights.
+
+    This test verifies:
+    - train() returns normally (no hang, no exception).
+    - The flat-group warning is logged.
+    - LoRA params did not meaningfully change (all-zero gradient).
     """
     import logging
 
@@ -498,34 +501,33 @@ def test_trainer_all_flat_batch_terminates_without_optimizer_step(
         output_dir=tmp_path / "ckpt",
         mlflow_dir=tmp_path / "mlruns",
     )
-    # Small step budget so the test stays fast even when every micro-step
-    # is flat and the loop runs the full num_train_steps iterations.
     cfg.training.num_train_steps = 2
     cfg.training.gradient_accumulation_steps = 1
     reward_fn = _DeterministicReward([0.0, 0.0, 0.0, 0.0])
 
-    optimizer_step_calls = {"n": 0}
-
     with _patched_compute_reward(reward_fn):
         trainer = GRPOTrainer(cfg)
 
-        real_step = trainer.optimizer.step
-
-        def counting_step(*a, **kw):
-            optimizer_step_calls["n"] += 1
-            return real_step(*a, **kw)
-
-        trainer.optimizer.step = counting_step  # type: ignore[assignment]
+        # Snapshot a trainable param before training.
+        lora_param = next(
+            p for _, p in trainer.model.named_parameters()
+            if p.requires_grad and "lora" in _.lower()
+        )
+        before = lora_param.detach().clone()
 
         caplog.set_level(logging.WARNING, logger="guac.training.trainer")
-        # Must return normally — no exception, no infinite loop.
         trainer.train()
 
-    # The optimizer must never have been called (no informative gradient).
-    assert optimizer_step_calls["n"] == 0, (
-        f"Optimizer fired on all-flat rewards; called "
-        f"{optimizer_step_calls['n']} times"
+        after = lora_param.detach().clone()
+
+    # Params should barely move — all gradients were zero (dummy loss).
+    # AdamW's eps-denominator moves weights by ~lr * eps which is ~1e-13.
+    delta = (after - before).abs().max().item()
+    assert delta < 1e-4, (
+        f"LoRA params changed by {delta:.6e} on all-flat rewards — "
+        f"expected near-zero movement from dummy-loss backward."
     )
+
     warn_text = "\n".join(
         rec.getMessage() for rec in caplog.records if rec.levelno >= 30
     )
