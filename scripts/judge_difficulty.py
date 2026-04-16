@@ -6,7 +6,9 @@ annotated files to ``{cfg.data.scored_dir}/{stem}.jsonl``.
 
 Each output record carries these difficulty fields:
   - ``difficulty``              — continuous float in (0, 1), or null on failure
-  - ``difficulty_integer``      — argmax integer (diagnostic)
+  - ``difficulty_text_value``   — text-parsed fallback value (float, may be
+                                  non-integer when the rubric prompts for a
+                                  continuous output) — diagnostic only
   - ``difficulty_probs``        — softmax probs over the supported single-token
                                   digit labels (``"1"`` through
                                   ``str(min(score_max, 9))``) — not necessarily

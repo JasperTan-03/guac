@@ -1,5 +1,6 @@
 # Project-specific
 # Top-level-only so it doesn't swallow src/guac/data/ (the Python package).
+wandb/
 /data/
 /checkpoints/
 /mlruns/
@@ -218,3 +219,4 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.worktrees/

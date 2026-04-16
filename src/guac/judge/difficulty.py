@@ -12,8 +12,10 @@ expected score:
 than bucketed to ``score_max`` discrete values. When ``score_max == 10``, the
 top end caps at ``0.9`` because the expectation excludes the ``"10"`` token
 (two-token in Qwen2; its first token is ``"1"`` and would collide with the
-``i=1`` bucket). The argmax integer is still stored as ``difficulty_integer``
-for diagnostics.
+``i=1`` bucket). A text-parsed fallback value (float — may be non-integer
+when the rubric prompt asks for a continuous output) is stored as
+``difficulty_text_value`` for diagnostics and used if logprobs were
+unavailable.
 
 The rubric text, score range, top-k, and split list are all read from
 ``cfg.judge`` so the same code can score any new dataset by overriding
@@ -75,15 +77,17 @@ def shard_records(
 # ---------------------------------------------------------------------------
 # Output parser (argmax from raw text — kept for diagnostics + text fallback)
 # ---------------------------------------------------------------------------
-def parse_difficulty_score(response: str, score_max: int = 10) -> Optional[int]:
-    """Extract the first integer in ``[1, score_max]`` from a raw VLM response.
+def parse_difficulty_score(
+    response: str, score_max: int = 10
+) -> Optional[float]:
+    """Extract the first number in ``[1.0, score_max]`` from a raw VLM response.
 
     Handles common malformed patterns such as:
 
-    - ``"Level 7"``        -> 7
-    - ``"7/10"``           -> 7
-    - ``"Difficulty: 7"``  -> 7
-    - ``"7.5"``            -> 7
+    - ``"Level 7"``        -> 7.0
+    - ``"7.5/10"``         -> 7.5
+    - ``"Difficulty: 7.2"``-> 7.2
+    - ``"7.5"``            -> 7.5
     - Multi-line output    -> strip and take first numeric token
 
     The upper bound is configurable so the parser stays consistent with the
@@ -96,8 +100,9 @@ def parse_difficulty_score(response: str, score_max: int = 10) -> Optional[int]:
         score_max: Rubric upper bound (inclusive). Defaults to 10.
 
     Returns:
-        An integer in ``[1, score_max]`` if one can be reliably extracted,
-        else ``None``.
+        A float in ``[1.0, score_max]`` if one can be reliably extracted,
+        else ``None``. Returned as a float so decimal outputs like ``"7.5"``
+        survive the parse; integer outputs like ``"7"`` simply return ``7.0``.
     """
     if not response:
         return None
@@ -105,14 +110,18 @@ def parse_difficulty_score(response: str, score_max: int = 10) -> Optional[int]:
     first_line = response.strip().split("\n")[0].strip()
     search_text = first_line if first_line else response.strip()
 
-    matches = re.findall(r"\b(\d+)\b", search_text)
+    matches = re.findall(r"\b(\d+(?:\.\d+)?)\b", search_text)
 
     if not matches:
-        matches = re.findall(r"\b(\d+)\b", response)
+        # Last-ditch: scan the entire response.
+        matches = re.findall(r"\b(\d+(?:\.\d+)?)\b", response)
 
     for match in matches:
-        value = int(match)
-        if 1 <= value <= score_max:
+        try:
+            value = float(match)
+        except ValueError:
+            continue
+        if 1.0 <= value <= float(score_max):
             return value
 
     return None
@@ -412,12 +421,12 @@ class DifficultyJudge:
                 expectation, probs = compute_continuous_difficulty(
                     lp0, self._tokenizer, self._score_max
                 )
-                score_int = parse_difficulty_score(raw_response, self._score_max)
+                text_value = parse_difficulty_score(raw_response, self._score_max)
 
                 if expectation is not None:
                     difficulty: Optional[float] = expectation / self._score_max
-                elif score_int is not None:
-                    difficulty = score_int / self._score_max
+                elif text_value is not None:
+                    difficulty = text_value / self._score_max
                 else:
                     difficulty = None
 
@@ -434,7 +443,7 @@ class DifficultyJudge:
                     "prompt": rec["prompt"],
                     "answer": rec["answer"],
                     "difficulty": difficulty,
-                    "difficulty_integer": score_int,
+                    "difficulty_text_value": text_value,
                     "difficulty_probs": probs,
                     "difficulty_raw_response": raw_response,
                     "difficulty_parse_error": parse_error,

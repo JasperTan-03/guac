@@ -145,12 +145,13 @@ def test_non_digit_tokens_yield_none():
 @pytest.mark.parametrize(
     "response,expected",
     [
-        ("7", 7),
-        ("Level 3", 3),
-        ("Difficulty: 8", 8),
-        ("5/10", 5),
-        ("7.5", 7),
-        ("10", 10),
+        ("7", 7.0),
+        ("Level 3", 3.0),
+        ("Difficulty: 8", 8.0),
+        ("5/10", 5.0),
+        ("7.5", 7.5),
+        ("Difficulty: 7.2", 7.2),
+        ("10", 10.0),
         ("", None),
         ("   ", None),
         ("no digits here", None),
@@ -162,17 +163,19 @@ def test_parse_difficulty_score_default_range(response, expected):
 
 def test_parse_difficulty_score_respects_score_max():
     # Default score_max=10 accepts the 10 bucket.
-    assert parse_difficulty_score("10") == 10
+    assert parse_difficulty_score("10") == 10.0
     # score_max=5 rejects 7 (out of rubric).
     assert parse_difficulty_score("7", score_max=5) is None
     # score_max=5 accepts the boundary.
-    assert parse_difficulty_score("5", score_max=5) == 5
+    assert parse_difficulty_score("5", score_max=5) == 5.0
+    # Float values work too.
+    assert parse_difficulty_score("4.7", score_max=5) == 4.7
     # Skips an OOR leading integer and finds a later valid one.
-    assert parse_difficulty_score("15 ... 3", score_max=5) == 3
+    assert parse_difficulty_score("15 ... 3", score_max=5) == 3.0
 
 
 def test_parse_difficulty_score_first_valid_wins():
-    assert parse_difficulty_score("scores: 3, 7, 9") == 3
+    assert parse_difficulty_score("scores: 3, 7, 9") == 3.0
 
 
 # --------------------------------------------------------------------------- #

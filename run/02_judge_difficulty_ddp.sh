@@ -14,9 +14,9 @@
 #   bash run/02_judge_difficulty_ddp.sh judge.batch_size=16
 #
 # Runtime on 8x A6000 with the 7B model: ~15 min for ~13k records
-# (compared to ~2 hrs single-GPU). Rank 0 does the HF download on
-# the first invocation; subsequent ranks share the same HF cache so
-# only one network fetch happens.
+# (compared to ~2 hrs single-GPU). On a COLD HF cache the first rank
+# pays the model download (~15 GB) alone; other ranks block briefly on
+# HF's filelock and then share the cache — no duplicate downloads.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,20 +34,33 @@ if [[ "${#GPU_ARRAY[@]}" -ne "$WORLD_SIZE" ]]; then
     exit 1
 fi
 
+# Sanity check — warn if user asked for more GPUs than nvidia-smi reports.
+if command -v nvidia-smi >/dev/null 2>&1; then
+    VISIBLE=$(nvidia-smi -L | wc -l | tr -d ' ')
+    if [[ "$WORLD_SIZE" -gt "$VISIBLE" ]]; then
+        echo "ERROR: WORLD_SIZE=$WORLD_SIZE exceeds visible GPU count ($VISIBLE)" >&2
+        exit 1
+    fi
+fi
+
 mkdir -p "$LOG_DIR"
 
 echo "=== Phase 2 (DDP): Difficulty Judging | world_size=$WORLD_SIZE | GPUs=$GPUS ==="
 
-# --- Warm the HF cache on rank 0 (serial) before fanning out -----------------
-# Avoids N simultaneous downloads of the VLM on first run. If the model is
-# already cached this is a ~10s no-op. Sample one record via --splits=val
-# and --batch_size=1 is overkill — rely on the user having run the single-GPU
-# script once before, or accept a brief serial fetch on the first rank.
-# (Intentionally no preload here — HF filelock handles concurrent cache
-#  reads; on a cold cache the first rank claims the lock and the others
-#  wait, which is safe but slow on cold start.)
-
+# --- Child-process cleanup on Ctrl-C / SIGTERM -------------------------------
+# Without this, ampersand-launched ranks get reparented to init and keep
+# chewing GPU if the user hits Ctrl-C. The trap sends SIGTERM to the whole
+# process group so all ranks die together.
+cleanup() {
+    echo "=== Received signal; killing all ranks... ===" >&2
+    if [[ "${#PIDS[@]}" -gt 0 ]]; then
+        kill -- "${PIDS[@]}" 2>/dev/null || true
+    fi
+    exit 130
+}
 PIDS=()
+trap cleanup INT TERM
+
 for RANK in $(seq 0 $((WORLD_SIZE - 1))); do
     GPU_ID="${GPU_ARRAY[$RANK]}"
     LOG_FILE="$LOG_DIR/rank${RANK}_gpu${GPU_ID}.log"
@@ -65,7 +78,7 @@ for RANK in $(seq 0 $((WORLD_SIZE - 1))); do
     PIDS+=("$!")
 done
 
-# --- Wait for all ranks; if any fails, kill the rest -------------------------
+# --- Wait for all ranks; propagate any non-zero exit --------------------------
 FAIL=0
 for i in "${!PIDS[@]}"; do
     if ! wait "${PIDS[$i]}"; then
@@ -73,6 +86,8 @@ for i in "${!PIDS[@]}"; do
         FAIL=1
     fi
 done
+
+trap - INT TERM
 
 if [[ "$FAIL" -ne 0 ]]; then
     echo "=== DDP judging FAILED. Shards left in place for debugging. ===" >&2
