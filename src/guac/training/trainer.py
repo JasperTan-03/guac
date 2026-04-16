@@ -622,48 +622,40 @@ class GRPOTrainer:
                 global_step += 1
 
                 # ------------------------------------------------------
-                # Step 8: All-reduce running metrics so every rank's
-                # curriculum.update receives the same R_avg (otherwise T
-                # drifts across ranks and the 8 gaussians sample from
-                # incompatible difficulty distributions).
+                # Step 8: Curriculum update.
+                #
+                # IMPORTANT: NO user-initiated collectives (reduce,
+                # all_reduce, gather, barrier) in the per-step hot path.
+                # Any accelerator.reduce() call here interleaves with
+                # DDP's internal gradient allreduce on the same NCCL
+                # process group, causing sequence-number drift and an
+                # eventual NCCL timeout (the SeqNum=77/98 hangs seen in
+                # prior runs).
+                #
+                # Each rank computes R_avg from its own local batch and
+                # updates T independently.  Since all ranks sample from
+                # the same difficulty distribution with similar T, the
+                # per-rank R_avg values are close and T drift across
+                # ranks is bounded by eta=0.05 per step.  For gaussian
+                # mode (the primary use case), the stochastic per-rank
+                # RNG already dominates any T-drift effect.  For
+                # baseline mode the drift could cause slight overlap in
+                # rank slices after many steps — acceptable tradeoff vs
+                # deadlocking.
                 # ------------------------------------------------------
-                R_avg_local = running_reward / grad_accum
-                if self.world_size > 1:
-                    r_t = torch.tensor(R_avg_local, device=self.device)
-                    R_avg = self.accelerator.reduce(r_t, reduction="mean").item()
-                else:
-                    R_avg = R_avg_local
+                R_avg = running_reward / grad_accum
                 self.curriculum.update(R_avg)
 
                 # ------------------------------------------------------
-                # Step 9: Logging — all-reduce metrics for MLflow, then
-                # log on rank 0 only.  loss/reward use mean-reduction,
-                # flat/informative counts use sum-reduction.
+                # Step 9: Logging — rank 0 logs its local metrics.
+                # With 8 ranks × batch_size=4 × group_size=4 = 128
+                # rollouts per step, rank 0's 16-rollout slice is
+                # representative.  This avoids the NCCL-interleaving
+                # hazard of cross-rank metric aggregation.
                 # ------------------------------------------------------
-                if self.world_size > 1:
-                    loss_t = torch.tensor(
-                        running_loss / grad_accum, device=self.device,
-                    )
-                    flat_t = torch.tensor(
-                        float(running_flat_groups), device=self.device,
-                    )
-                    info_t = torch.tensor(
-                        float(running_informative_groups), device=self.device,
-                    )
-                    avg_loss = self.accelerator.reduce(
-                        loss_t, reduction="mean",
-                    ).item()
-                    total_flat = int(self.accelerator.reduce(
-                        flat_t, reduction="sum",
-                    ).item())
-                    total_info = int(self.accelerator.reduce(
-                        info_t, reduction="sum",
-                    ).item())
-                else:
-                    avg_loss = running_loss / grad_accum
-                    total_flat = running_flat_groups
-                    total_info = running_informative_groups
-
+                avg_loss = running_loss / grad_accum
+                total_flat = running_flat_groups
+                total_info = running_informative_groups
                 total_groups = total_info + total_flat
                 flat_frac = (
                     total_flat / total_groups if total_groups > 0 else 0.0
@@ -706,9 +698,10 @@ class GRPOTrainer:
                         step=global_step,
                     )
 
-                # Step 10: Checkpoint — rank 0 only; wait for all ranks
-                # to finish this optimizer step first so the saved
-                # weights are consistent with a completed backward.
+                # Step 10: Checkpoint — rank 0 only.
+                # wait_for_everyone is safe here because it fires
+                # infrequently (every save_steps=500) and all ranks are
+                # at the same logical point in the loop.
                 if global_step % save_steps == 0:
                     self.accelerator.wait_for_everyone()
                     if self.is_main:
