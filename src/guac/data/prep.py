@@ -181,6 +181,66 @@ def load_scienceqa(
 # ---------------------------------------------------------------------------
 
 
+def load_mathverse(hf_id: str, split: str) -> List[Dict]:
+    """Load the MathVerse dataset for the given split.
+
+    Args:
+        hf_id: The HuggingFace dataset identifier (e.g. ``"AI4Math/MathVerse"``).
+        split: The dataset split to load.
+
+    Returns:
+        A list of dicts with keys ``id``, ``image``, ``prompt``, and ``answer``.
+    """
+    import datasets as hf_datasets
+
+    logger.info(f"Loading {hf_id} split={split}")
+    # MathVerse uses 'testmini' config. If we need something else later we can adapt.
+    ds = hf_datasets.load_dataset(hf_id, "testmini", split=split)
+
+    records: List[Dict] = []
+    skipped = 0
+
+    for idx, row in enumerate(ds):
+        row_id = f"mathverse_{split}_{idx}"
+
+        # --- image ---
+        image_b64: Optional[str] = None
+        pil_img = safe_load_image(row.get("image"))
+
+        if pil_img is not None:
+            image_b64 = encode_image(pil_img)
+
+        # --- prompt ---
+        # The prompt is in the 'question' field (sometimes 'query_wo' or 'query_cot')
+        # Here we use 'question' and strip MC formatting if present
+        raw_question = row.get("question", "") or ""
+        prompt = strip_mc_from_text(raw_question)
+
+        # --- answer ---
+        answer = str(row.get("answer", "")).strip()
+
+        if not prompt or not answer:
+            logger.debug(
+                f"mathverse: skipping {row_id} — empty prompt or answer"
+            )
+            skipped += 1
+            continue
+
+        records.append(
+            {"id": row_id, "image": image_b64, "prompt": prompt, "answer": answer}
+        )
+
+    logger.info(
+        f"mathverse split={split}: {len(records)} records kept, {skipped} skipped"
+    )
+    return records
+
+
+# ---------------------------------------------------------------------------
+# JSONL I/O
+# ---------------------------------------------------------------------------
+
+
 def save_jsonl(records: List[Dict], path: str) -> None:
     """Write records to a JSONL file (one JSON object per line).
 
@@ -229,6 +289,7 @@ def load_jsonl(path: str) -> List[Dict]:
 _LOADERS = {
     "geometry3k": load_geometry3k,
     "scienceqa": load_scienceqa,
+    "mathverse": load_mathverse,
 }
 
 

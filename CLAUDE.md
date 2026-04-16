@@ -20,7 +20,9 @@ uv pip install -e ".[dev]"
 
 **GPU constraint** (single-GPU launch): scripts pin to GPU 0 by default. The `gpu_id` value in `conf/config.yaml` is set at the top of each script via `os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)`.
 
-**Multi-GPU launch**: `bash run/03_train_gaussian_ddp.sh` wraps `accelerate launch --config_file=accelerate_config.yaml scripts/train.py ...`. In that path, accelerate sets `LOCAL_RANK` and manages device assignment itself; `scripts/train.py` only applies the `cfg.gpu_id` override when `LOCAL_RANK` is absent.
+**Multi-GPU launch**: `bash run/03_train_reinforce_ddp.sh` wraps `accelerate launch --config_file=accelerate_config.yaml scripts/train.py ...`. In that path, accelerate sets `LOCAL_RANK` and manages device assignment itself; `scripts/train.py` only applies the `cfg.gpu_id` override when `LOCAL_RANK` is absent.
+
+**Data location**: The scored dataset lives at `/data/troy/datasets/guac/scored/`. This is hardcoded in `conf/data/default.yaml`. Phase 1/2 outputs also point there.
 
 Lint before committing:
 
@@ -34,8 +36,8 @@ Lint before committing:
 ```bash
 bash run/01_prepare_data.sh            # loads all splits → data/raw/ + data/processed/
 bash run/02_judge_difficulty.sh        # scores all splits → data/scored/
-bash run/03_train_gaussian.sh          # single-GPU GRPO training → checkpoints/
-bash run/03_train_gaussian_ddp.sh      # 8x DDP via accelerate → checkpoints/
+bash run/03_train_reinforce.sh         # single-GPU REINFORCE training → checkpoints/
+bash run/03_train_reinforce_ddp.sh     # 8× DDP via accelerate → checkpoints/
 bash run/04_evaluate.sh                # eval → results/eval_results.json
 ```
 
@@ -48,9 +50,9 @@ python scripts/evaluate.py checkpoint_path=checkpoints/step_500 gpu_id=0
 
 ## Architecture
 
-The project is a 4-phase VLM RL pipeline: data prep → difficulty judging → GRPO training → evaluation.
+The project is a 4-phase VLM RL pipeline: data prep → difficulty judging → REINFORCE training → evaluation.
 
-**Data flow**: `data/processed/{train,val,test}.jsonl` → difficulty judging → `data/scored/{train,val,test}.jsonl` → GRPO training → `checkpoints/` → evaluation → `results/eval_results.json`.
+**Data flow**: `data/processed/{train,val,test}.jsonl` → difficulty judging → `data/scored/{train,val,test}.jsonl` → REINFORCE training → `checkpoints/` → evaluation → `results/eval_results.json`.
 
 **Record schema**: Every JSONL record carries `id` (str), `image` (base64 PNG string or null), `prompt` (str), `answer` (str). Scored records additionally carry `difficulty` (float in [0.0, 1.0], AoPS score ÷ 10), `difficulty_raw_response`, `difficulty_parse_error`.
 
@@ -59,20 +61,34 @@ The project is a 4-phase VLM RL pipeline: data prep → difficulty judging → G
 - `data/prep.py` — `prepare_all(cfg)` loads geometry3k + ScienceQA for all splits; `load_jsonl`/`save_jsonl` used everywhere
 - `judge/difficulty.py` — `DifficultyJudge` wraps vLLM; `score_split(input, output)` adds difficulty fields; resumes from `.ckpt` file on crash
 - `training/curriculum.py` — `CurriculumState` dataclass (T update rule) + `CurriculumSampler` (baseline/gaussian modes)
-- `training/rewards.py` — reward computation, group normalization, log-prob calculation, GRPO loss
-- `training/trainer.py` — `GRPOTrainer` uses all of the above; logs to MLflow at each `log_steps`
+- `training/rewards.py` — reward computation (exact match, SymPy equivalence, substring), log-prob helpers
+- `training/reinforce_trainer.py` — `ReinforceTrainer` uses REINFORCE + EMA baseline; generates G=1 response per prompt; KL via `disable_adapter()`; logs to MLflow
+- `training/trainer.py` — **[DEPRECATED]** old `GRPOTrainer`, kept for reference
 - `evaluation/evaluator.py` — `run_evaluation(cfg, checkpoint_path)` evaluates on MathVista and MMMU; logs to MLflow
+
+**Training algorithm (REINFORCE + EMA baseline)**:
+1. Sample batch of B prompts via Gaussian curriculum (Equation 2)
+2. Generate **one** response per prompt (G=1)
+3. Score with exact-match reward → R_i
+4. Policy log-probs via teacher forcing; reference log-probs via `model.disable_adapter()` (zero extra VRAM)
+5. KL penalty: KL_i = policy_logprob - ref_logprob
+6. Adjusted reward: R_hat_i = R_i - λ·KL_i
+7. Advantage: A_i = R_hat_i - b (EMA baseline)
+8. EMA update: b ← α·b + (1-α)·R_avg
+9. Loss: L = -mean(A.detach() · policy_logprobs)
 
 **Curriculum update rule**: `T_new = clip(T + η·tanh(α·(R_avg - β)), d_min, d_max)` — called once per optimizer step.
 
-**Training memory**: LoRA (r=8, targets q/k/v/o_proj) keeps the 7B model trainable within 48 GB VRAM (A6000). If OOM, override: `training.batch_size=1 training.gradient_accumulation_steps=8`.
+**Training memory**: LoRA (r=8, targets q/k/v/o_proj) keeps the 7B model trainable within 48 GB VRAM (A6000). KL reference uses `disable_adapter()` — no second model loaded.
 
 ## Config System
 
 All hyperparameters live in `conf/`. Root `conf/config.yaml` composes sub-configs via Hydra's defaults list. Key sub-configs:
-- `conf/training/grpo.yaml` — steps (5000), batch size (2), group size (4), sampling mode, MLflow experiment name
+- `conf/training/reinforce.yaml` — steps (5000), batch size (8), EMA decay (0.95), KL coeff (0.1), sampling mode, MLflow experiment name
 - `conf/model/qwen2_vl_7b.yaml` — LoRA settings (r=8, lora_alpha=16)
 - `conf/judge/vllm.yaml` — vLLM batch size (32), checkpoint interval (500 rows)
+
+**Legacy**: `conf/training/grpo.yaml` is preserved but no longer the default. It can be activated with `python scripts/train.py training=grpo` but the GRPOTrainer will need to be re-imported in `scripts/train.py`.
 
 ## MLflow
 

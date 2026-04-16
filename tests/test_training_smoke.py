@@ -401,7 +401,7 @@ def test_trainer_skips_flat_groups_and_produces_nonzero_loss_on_varied(
 
     cfg = _build_smoke_cfg(
         output_dir=tmp_path / "ckpt",
-        mlflow_dir=tmp_path / "mlruns",
+
     )
 
     # Pattern:
@@ -499,7 +499,7 @@ def test_trainer_all_flat_batch_terminates_and_logs_warning(
 
     cfg = _build_smoke_cfg(
         output_dir=tmp_path / "ckpt",
-        mlflow_dir=tmp_path / "mlruns",
+
     )
     cfg.training.num_train_steps = 2
     cfg.training.gradient_accumulation_steps = 1
@@ -534,3 +534,219 @@ def test_trainer_all_flat_batch_terminates_and_logs_warning(
     assert "flat" in warn_text.lower(), (
         "Expected a flat-group warning; got:\n" + warn_text
     )
+
+
+# --------------------------------------------------------------------------- #
+# REINFORCE trainer smoke tests
+# --------------------------------------------------------------------------- #
+
+
+def _build_reinforce_smoke_cfg(output_dir: Path) -> OmegaConf:
+    """Build a minimal config for the REINFORCE trainer smoke test."""
+    cfg = OmegaConf.create(
+        {
+            "gpu_id": 0,
+            "data": {"scored_dir": str(FIXTURE_DIR)},
+            "model": {
+                "name": TINY_MODEL,
+                "dtype": "float32",
+                "lora": {
+                    "r": 4,
+                    "lora_alpha": 8,
+                    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+                    "lora_dropout": 0.0,
+                    "bias": "none",
+                },
+            },
+            "training": {
+                "output_dir": str(output_dir),
+                "batch_size": 1,
+                "gradient_accumulation_steps": 1,
+                "learning_rate": 1e-4,
+                "weight_decay": 0.0,
+                "max_grad_norm": 1.0,
+                "num_train_steps": 2,
+                "warmup_steps": 0,
+                "save_steps": 9999,
+                "log_steps": 1,
+                "max_new_tokens": 4,
+                "temperature": 1.0,
+                "top_p": 0.9,
+                "sampling_mode": "gaussian",
+                "T_init": 0.5,
+                "eta": 0.05,
+                "alpha": 2.0,
+                "beta": 0.5,
+                "sigma": 0.15,
+                "d_min": 0.0,
+                "d_max": 1.0,
+                "ema_decay": 0.95,
+                "kl_coeff": 0.1,
+                "wandb_project": "guac-test",
+            },
+        }
+    )
+    return cfg
+
+
+def _patched_compute_reward_reinforce(reward_fn):
+    """Patch compute_reward for the REINFORCE trainer module."""
+    return patch("guac.training.reinforce_trainer.compute_reward", new=reward_fn)
+
+
+@_requires_tiny_model
+def test_reinforce_trainer_produces_nonzero_loss(
+    tmp_path: Path, caplog
+):
+    """REINFORCE trainer must produce non-zero loss with varied rewards.
+
+    With rewards [1.0, 0.0] on consecutive steps, the EMA baseline provides
+    an advantage signal that drives a non-zero gradient through LoRA params.
+    """
+    import logging
+
+    from guac.training.reinforce_trainer import ReinforceTrainer
+
+    cfg = _build_reinforce_smoke_cfg(
+        output_dir=tmp_path / "ckpt",
+
+    )
+
+    # Alternating rewards: step 1 gets reward 1.0, step 2 gets 0.0
+    reward_fn = _DeterministicReward([1.0, 0.0])
+    captured_grad_norms: List[float] = []
+
+    with _patched_compute_reward_reinforce(reward_fn):
+        trainer = ReinforceTrainer(cfg)
+
+        lora_param = next(
+            p for n, p in trainer.model.named_parameters()
+            if p.requires_grad and "lora_A" in n
+        )
+        coefficients = [-3.0, -5.0]
+        call_idx = {"n": 0}
+
+        def fake_log_probs(prompt_inputs, gen_ids):
+            c = coefficients[call_idx["n"] % len(coefficients)]
+            call_idx["n"] += 1
+            return lora_param.sum() * c
+
+        trainer._compute_seq_log_probs = fake_log_probs  # type: ignore[assignment]
+        # Also patch the no-grad version to return detached values
+        trainer._compute_seq_log_probs_no_grad = (  # type: ignore[assignment]
+            lambda pi, gi: torch.tensor(-4.0)
+        )
+
+        real_step = trainer.optimizer.step
+
+        def step_with_probe(*a, **kw):
+            g_sq = 0.0
+            for p in trainer.model.parameters():
+                if p.requires_grad and p.grad is not None:
+                    g_sq += float(p.grad.detach().abs().pow(2).sum().item())
+            captured_grad_norms.append(g_sq ** 0.5)
+            return real_step(*a, **kw)
+
+        trainer.optimizer.step = step_with_probe  # type: ignore[assignment]
+
+        caplog.set_level(logging.INFO, logger="guac.training.reinforce_trainer")
+        trainer.train()
+
+    assert any(g > 0 for g in captured_grad_norms), (
+        f"Expected at least one optimizer step with non-zero gradient norm "
+        f"on LoRA params; got {captured_grad_norms!r}."
+    )
+
+
+@_requires_tiny_model
+def test_reinforce_ema_baseline_updates(tmp_path: Path):
+    """EMA baseline must advance from 0.0 after training steps."""
+    from guac.training.reinforce_trainer import ReinforceTrainer
+
+    cfg = _build_reinforce_smoke_cfg(
+        output_dir=tmp_path / "ckpt",
+
+    )
+
+    reward_fn = _DeterministicReward([1.0, 1.0])
+
+    with _patched_compute_reward_reinforce(reward_fn):
+        trainer = ReinforceTrainer(cfg)
+        # Patch log-prob computation to avoid real model forward
+        lora_param = next(
+            p for n, p in trainer.model.named_parameters()
+            if p.requires_grad and "lora_A" in n
+        )
+        trainer._compute_seq_log_probs = (  # type: ignore[assignment]
+            lambda pi, gi: lora_param.sum() * -3.0
+        )
+        trainer._compute_seq_log_probs_no_grad = (  # type: ignore[assignment]
+            lambda pi, gi: torch.tensor(-4.0)
+        )
+
+        assert trainer.ema_baseline == 0.0  # initial value
+        trainer.train()
+
+    assert trainer.ema_baseline > 0.0, (
+        f"EMA baseline should be >0 after training with reward=1.0; "
+        f"got {trainer.ema_baseline}"
+    )
+
+
+@_requires_tiny_model
+def test_reinforce_all_same_reward_still_has_gradient(tmp_path: Path):
+    """THE critical test: all-identical rewards must still produce a gradient.
+
+    This is the exact failure mode that killed GRPO — with binary rewards,
+    every group collapses to all-0 or all-1, producing zero advantages and
+    zero gradient. REINFORCE + EMA baseline must NOT have this problem.
+
+    With EMA baseline starting at 0.0 and all rewards = 1.0, the advantage
+    is 1.0 - 0.0 = 1.0 on the first step → clear gradient signal.
+    """
+    from guac.training.reinforce_trainer import ReinforceTrainer
+
+    cfg = _build_reinforce_smoke_cfg(
+        output_dir=tmp_path / "ckpt",
+
+    )
+
+    # ALL rewards are 1.0 — the exact scenario that makes GRPO produce zero loss.
+    reward_fn = _DeterministicReward([1.0, 1.0])
+    captured_grad_norms: List[float] = []
+
+    with _patched_compute_reward_reinforce(reward_fn):
+        trainer = ReinforceTrainer(cfg)
+
+        lora_param = next(
+            p for n, p in trainer.model.named_parameters()
+            if p.requires_grad and "lora_A" in n
+        )
+        trainer._compute_seq_log_probs = (  # type: ignore[assignment]
+            lambda pi, gi: lora_param.sum() * -3.0
+        )
+        trainer._compute_seq_log_probs_no_grad = (  # type: ignore[assignment]
+            lambda pi, gi: torch.tensor(-4.0)
+        )
+
+        real_step = trainer.optimizer.step
+
+        def step_with_probe(*a, **kw):
+            g_sq = 0.0
+            for p in trainer.model.parameters():
+                if p.requires_grad and p.grad is not None:
+                    g_sq += float(p.grad.detach().abs().pow(2).sum().item())
+            captured_grad_norms.append(g_sq ** 0.5)
+            return real_step(*a, **kw)
+
+        trainer.optimizer.step = step_with_probe  # type: ignore[assignment]
+        trainer.train()
+
+    # REINFORCE + EMA baseline: advantage = 1.0 - 0.0 = 1.0 → non-zero grad.
+    # GRPO would have produced [0,0,0,0] advantages here → zero grad.
+    assert all(g > 0 for g in captured_grad_norms), (
+        f"CRITICAL: All-identical rewards produced zero gradient — "
+        f"the GRPO flat-group bug has regressed! "
+        f"Grad norms: {captured_grad_norms!r}"
+    )
+

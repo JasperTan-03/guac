@@ -1,7 +1,7 @@
 defaults:
   - data: default
   - model: qwen2_vl_7b
-  - training: grpo
+  - training: reinforce
   - judge: vllm
   - evaluation: default
   - _self_

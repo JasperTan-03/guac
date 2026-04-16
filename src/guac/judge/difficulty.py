@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = (
     "You are a mathematics subject matter expert and competition problem classifier.\n"
-    "Your task is to assess the difficulty of the following mathematical problem on a scale from 1 to 10\n"
+    "Your task is to assess the difficulty of the following mathematical problem on a continuous scale from 1 to 10\n"
     "using the Art of Problem Solving (AoPS) difficulty rubric:\n"
     "\n"
     "AoPS Difficulty Scale:\n"
@@ -42,29 +42,29 @@ SYSTEM_PROMPT = (
     "Instructions:\n"
     "- Carefully read the problem text and examine any provided image.\n"
     "- Consider the mathematical concepts required, the number of steps, and the creativity needed.\n"
-    "- Respond with ONLY a single integer between 1 and 10. No explanation, no punctuation, no extra text."
+    "- Respond with ONLY a single continuous number between 1 and 10 (e.g., 5.5, 7.2). No explanation, no punctuation, no extra text."
 )
 
 
 # ---------------------------------------------------------------------------
 # Output parser
 # ---------------------------------------------------------------------------
-def parse_difficulty_score(response: str) -> Optional[int]:
-    """Extract the first integer in [1, 10] from a raw VLM response string.
+def parse_difficulty_score(response: str) -> Optional[float]:
+    """Extract the first number in [1.0, 10.0] from a raw VLM response string.
 
     Handles common malformed patterns such as:
 
-    - ``"Level 7"``        -> 7
-    - ``"7/10"``           -> 7
-    - ``"Difficulty: 7"``  -> 7
-    - ``"7.5"``            -> 7
+    - ``"Level 7"``        -> 7.0
+    - ``"7.5/10"``         -> 7.5
+    - ``"Difficulty: 7.2"``-> 7.2
+    - ``"7.5"``            -> 7.5
     - Multi-line output    -> strip and take first numeric token
 
     Args:
         response: Raw string returned by the VLM.
 
     Returns:
-        An integer in [1, 10] if one can be reliably extracted, else None.
+        A float in [1.0, 10.0] if one can be reliably extracted, else None.
     """
     if not response:
         return None
@@ -74,16 +74,19 @@ def parse_difficulty_score(response: str) -> Optional[int]:
     first_line = response.strip().split("\n")[0].strip()
     search_text = first_line if first_line else response.strip()
 
-    matches = re.findall(r"\b(\d+)\b", search_text)
+    matches = re.findall(r"\b(\d+(?:\.\d+)?)\b", search_text)
 
     if not matches:
         # Last-ditch: scan the entire response.
-        matches = re.findall(r"\b(\d+)\b", response)
+        matches = re.findall(r"\b(\d+(?:\.\d+)?)\b", response)
 
     for match in matches:
-        value = int(match)
-        if 1 <= value <= 10:
-            return value
+        try:
+            value = float(match)
+            if 1.0 <= value <= 10.0:
+                return value
+        except ValueError:
+            pass
 
     return None
 
@@ -268,8 +271,8 @@ class DifficultyJudge:
             raw_responses = self._run_batch(batch_records)
 
             for rec, raw_response in zip(batch_records, raw_responses):
-                score_int = parse_difficulty_score(raw_response)
-                parse_error = score_int is None
+                score_val = parse_difficulty_score(raw_response)
+                parse_error = score_val is None
 
                 if parse_error:
                     logger.warning(
@@ -277,7 +280,7 @@ class DifficultyJudge:
                     )
 
                 difficulty: Optional[float] = (
-                    score_int / 10.0 if score_int is not None else None
+                    score_val / 10.0 if score_val is not None else None
                 )
 
                 annotated: Dict = {
