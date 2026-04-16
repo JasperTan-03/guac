@@ -501,35 +501,33 @@ class GRPOTrainer:
                 # Steps 5–6: Teacher-forcing log-probs (train mode)
                 # ----------------------------------------------------------
                 self.model.train()
+                from contextlib import nullcontext
+                
+                # To prevent OOM, compute gradients per sequence and free graph
+                # Use no_sync to accumulate local gradients until the VERY last generated sequence in the micro-step!
+                # Wait, this is done per-record. To do it per-microstep, we need
+                # all elements. Let's just accumulate log_probs but detach them? No, we need gradients.
+                
                 for gen_ids, advantage in zip(
                     group_generated_ids, norm_rewards
                 ):
                     gen_len = gen_ids.shape[1]
                     full_ids = torch.cat(
                         [prompt_inputs["input_ids"], gen_ids], dim=1
-                    )  # (1, prompt_len + gen_len)
-
-                    # Preserve prompt padding mask; generated tokens always attend.
+                    )
                     full_mask = torch.cat([
                         prompt_inputs["attention_mask"],
                         torch.ones((1, gen_len), dtype=prompt_inputs["attention_mask"].dtype, device=self.device),
                     ], dim=1)
 
-                    # Mask prompt positions in labels so they do not contribute
-                    # to the log-prob computation.
                     labels = full_ids.clone()
                     labels[:, :prompt_len] = -100
 
-                    # Pass pixel_values and image_grid_thw through if present.
                     extra_kwargs: Dict[str, torch.Tensor] = {}
                     for k in ("pixel_values", "image_grid_thw"):
                         if k in prompt_inputs:
                             extra_kwargs[k] = prompt_inputs[k]
 
-                    # Standard GRPO: use the current policy's log-prob directly.
-                    # L = -E[Â_i · log π_θ(y_i | x_i)]
-                    # _compute_seq_log_probs returns mean per-token log-prob,
-                    # so the signal is already length-normalised.
                     log_prob = self._compute_seq_log_probs(
                         full_ids, full_mask, labels, extra_kwargs
                     )
