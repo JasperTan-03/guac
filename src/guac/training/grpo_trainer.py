@@ -58,10 +58,11 @@ from guac.data.utils import decode_image
 from guac.training.curriculum import CurriculumSampler, CurriculumState
 from guac.training.rewards import compute_reward
 
+
 class CustomGRPOTrainer(GRPOTrainer):
     def create_optimizer(self):
         """Override to filter out empty parameter groups (e.g., no_decay group in LoRA).
-        
+
         DeepSpeed ZeRO-2 drops empty parameter groups automatically. If the Trainer
         creates an empty group (e.g., for biases/LayerNorms when only LoRA is active),
         DeepSpeed drops it, but the LR scheduler expects the original number of groups,
@@ -223,7 +224,6 @@ class GUACGRPOTrainer:
         num_epochs = int(tcfg.num_epochs)
         steps_per_epoch = int(tcfg.steps_per_epoch)
         per_device_batch = int(tcfg.per_device_train_batch_size)
-        num_generations = int(tcfg.num_generations)
         # How many unique prompts to include in each epoch-dataset.
         # world_size × per_device_batch × steps_per_epoch gives the total
         # prompt slots consumed; we provide 2× headroom for shuffling.
@@ -271,7 +271,7 @@ class GUACGRPOTrainer:
 
             trainer = CustomGRPOTrainer(
                 model=str(self.cfg.model.name),
-                reward_funcs=[self._make_reward_fn()],
+                reward_funcs=[self._make_reward_fn(), self._make_format_reward_fn()],
                 args=grpo_config,
                 train_dataset=train_dataset,
                 peft_config=self.peft_config,
@@ -394,6 +394,39 @@ class GUACGRPOTrainer:
         data: Dict[str, List[Any]] = {"prompt": prompts, "answer": answers, "images": images}
         return hf_datasets.Dataset.from_dict(data)
 
+    @staticmethod
+    def _extract_completion_text(completion: Any) -> str:
+        """Extract the plain-text string from a TRL completion value.
+
+        TRL passes completions in one of two formats depending on the model
+        and processor:
+          - Plain string (most text-only models).
+          - List of message dicts (conversational / multimodal format), where
+            the last dict is the assistant turn.  The ``content`` field is
+            either a plain string *or* a list of content-part dicts such as
+            ``[{"type": "text", "text": "..."}]`` (Qwen2-VL multimodal).
+
+        Args:
+            completion: Raw completion value from TRL.
+
+        Returns:
+            Plain text content of the assistant's response.
+        """
+        if isinstance(completion, list) and completion and isinstance(completion[0], dict):
+            # Conversational format — take the last message (assistant turn).
+            content = completion[-1].get("content", "")
+        else:
+            content = completion
+
+        # Multimodal content-part list: [{"type": "text", "text": "..."}, ...]
+        if isinstance(content, list):
+            return " ".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        return str(content)
+
     def _make_reward_fn(self):
         """Return a TRL-compatible reward function wrapping ``compute_reward``.
 
@@ -407,19 +440,53 @@ class GUACGRPOTrainer:
         Returns:
             Callable with signature ``(completions, **kwargs) -> List[float]``.
         """
+        extract = self._extract_completion_text
+
         def reward_fn(completions: List[Any], **kwargs) -> List[float]:
             answers = kwargs.get("answer", [])
             rewards = []
             for completion, gt in zip(completions, answers):
-                # TRL conversational format passes completions as message dicts
-                if isinstance(completion, list) and len(completion) > 0 and isinstance(completion[0], dict):
-                    completion_text = completion[-1].get("content", "")
-                else:
-                    completion_text = str(completion)
+                completion_text = extract(completion)
                 rewards.append(compute_reward(completion_text, gt))
             return rewards
 
         return reward_fn
+
+    @staticmethod
+    def _make_format_reward_fn():
+        """Return a TRL-compatible reward function that scores output format.
+
+        Rewards the model for following the expected ``<think>…</think>``
+        reasoning + short final-answer structure.  This provides a non-zero
+        signal early in training when accuracy is near 0% and every
+        correctness-reward group is flat (all zeros → no GRPO gradient).
+
+        The maximum format reward is 0.2, so it cannot dominate the
+        correctness signal once the model starts answering correctly.
+
+        Returns:
+            Callable with signature ``(completions, **kwargs) -> List[float]``.
+        """
+        import re as _re
+        _think_open = _re.compile(r"<think>", _re.IGNORECASE)
+        _think_close = _re.compile(r"</think>", _re.IGNORECASE)
+        _extract = GUACGRPOTrainer._extract_completion_text
+
+        def format_reward_fn(completions: List[Any], **kwargs) -> List[float]:
+            rewards = []
+            for completion in completions:
+                text = _extract(completion)
+                score = 0.0
+                # +0.1 for opening <think> tag
+                if _think_open.search(text):
+                    score += 0.1
+                # +0.1 for closing </think> tag (model completed its reasoning)
+                if _think_close.search(text):
+                    score += 0.1
+                rewards.append(score)
+            return rewards
+
+        return format_reward_fn
 
     def _build_grpo_config(self, epoch: int, max_steps: int) -> GRPOConfig:
         """Build a ``GRPOConfig`` for one curriculum epoch.
@@ -464,6 +531,15 @@ class GUACGRPOTrainer:
             vllm_server_host=str(tcfg.vllm_server_host),
             vllm_server_port=int(tcfg.vllm_server_port),
 
+            # KL penalty coefficient.  TRL default is 0.04 (GRPO paper value),
+            # but 0.1 better prevents rapid policy divergence on VLMs where the
+            # reward signal is sparse early in training.
+            beta=float(tcfg.get("beta", 0.1)),
+
+            # On-policy: use each group of completions for exactly 1 gradient
+            # update.  num_iterations > 1 would make GRPO off-policy.
+            num_iterations=1,
+
             # Precision (A6000s support bf16)
             bf16=True,
 
@@ -476,7 +552,7 @@ class GUACGRPOTrainer:
 
             # Don't run eval during GRPO epochs (no eval set configured)
             do_eval=False,
-            
+
             # Don't skip batches in the new epoch's dataset when resuming
             ignore_data_skip=True,
         )

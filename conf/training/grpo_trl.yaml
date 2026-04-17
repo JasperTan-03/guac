@@ -38,6 +38,14 @@ temperature: 1.0              # high → diverse rollouts → richer GRPO signal
 top_p: 0.9
 
 # ---------------------------------------------------------------------------
+# GRPO algorithm parameters
+# ---------------------------------------------------------------------------
+# KL penalty coefficient.  Controls how far the policy is allowed to drift
+# from the frozen reference model.  TRL default is 0.04 (GRPO paper).
+# We use 0.1 — higher values prevent rapid mode collapse on sparse rewards.
+beta: 0.1
+
+# ---------------------------------------------------------------------------
 # Curriculum (shared with REINFORCE — Equations 1 & 2 from the paper)
 # ---------------------------------------------------------------------------
 sampling_mode: gaussian       # baseline | gaussian
