@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Start the vLLM generation server on GPU 0 (TP=1).
+# Start the vLLM generation server on GPUs 0–1 (TP=2).
 #
-# The 7B model (~14 GB) fits on a single A6000 (48 GB) — no tensor parallelism
-# needed.  TP=1 avoids inter-GPU all-reduce overhead on every forward pass.
+# TP=2 splits the 7B model across 2 A6000 GPUs, roughly doubling the available
+# KV-cache memory.  With per_device_train_batch_size=2 and 6 training GPUs,
+# each micro-step sends 2×8×6=96 concurrent completion requests — TP=2 can
+# serve all of them without queuing (TP=1 caps out at ~48).
 #
 # This must be running BEFORE launching the training job.
 # The server will be ready when you see:
@@ -29,13 +31,14 @@ echo "  Model:          ${MODEL}"
 echo "  Port:           ${VLLM_PORT}"
 echo "  Max model len:  ${MAX_MODEL_LEN}"
 echo "  GPU util:       ${GPU_UTIL}"
-echo "  GPUs:           0 (TP=1)"
+echo "  GPUs:           0,1 (TP=2)"
 echo ""
 echo "Wait for 'Application startup complete' before launching training."
 echo ""
 
-CUDA_VISIBLE_DEVICES=0 trl vllm-serve \
+CUDA_VISIBLE_DEVICES=0,1 trl vllm-serve \
     --model "${MODEL}" \
+    --tensor-parallel-size 2 \
     --max-model-len "${MAX_MODEL_LEN}" \
     --gpu-memory-utilization "${GPU_UTIL}" \
     --port "${VLLM_PORT}" \

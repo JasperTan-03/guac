@@ -3,16 +3,17 @@ output_dir: checkpoints
 # ---------------------------------------------------------------------------
 # Batch / optimisation
 # ---------------------------------------------------------------------------
-# per_device_train_batch_size × num_generations × world_size = rollouts/step
-# 1 × 8 × 7 = 56 rollouts per optimizer step (vs 8 for REINFORCE).
+# per_device_train_batch_size × num_generations × world_size = rollouts/micro-step
+# 2 × 8 × 6 = 96 rollouts per micro-step (fits TP=2 vLLM capacity).
+# Effective batch per optimizer step: 2 × 8 × 4 × 6 = 384 reward signals.
 # GRPO benefits from within-group reward variance; keep num_generations >= 8.
-per_device_train_batch_size: 1
+per_device_train_batch_size: 2
 num_generations: 8            # G — responses generated per prompt
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 4
 learning_rate: 2e-5
 weight_decay: 0.01
 max_grad_norm: 1.0
-warmup_steps: 100
+warmup_steps: 20
 save_steps: 500
 log_steps: 10
 

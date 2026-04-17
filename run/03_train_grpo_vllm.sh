@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# Phase 3: GRPO Training — 1/7 GPU split with vLLM Server Mode.
+# Phase 3: GRPO Training — 2/6 GPU split with vLLM Server Mode.
 #
 # Architecture:
-#   GPU 0   → vLLM generation server (TP=1; 7B model fits in 14 GB << 48 GB)
-#   GPUs 1–7 → GRPOTrainer, DeepSpeed ZeRO-2, 7-way DDP
+#   GPUs 0–1 → vLLM generation server (TP=2; doubles KV-cache capacity vs TP=1)
+#   GPUs 2–7 → GRPOTrainer, DeepSpeed ZeRO-2, 6-way DDP
 #
-# TP=4 on a 7B model adds all-reduce overhead on every transformer layer with
-# no memory benefit (14 GB << 48 GB per A6000).  Freeing 3 GPUs for training
-# increases gradient throughput by ~75% vs the old 4/4 split.
+# Why TP=2?  With TP=1, a single A6000 (48 GB) can serve ~48 concurrent
+# sequences.  But 6 training GPUs × batch_size=2 × num_generations=8 = 96
+# concurrent completion requests per micro-step.  TP=2 splits the model
+# across 2 GPUs, roughly doubling available KV-cache memory so all 96
+# requests can be served without queuing.
 #
 # This script:
-#   1. Starts the vLLM server in the background on GPU 0.
+#   1. Starts the vLLM server in the background on GPUs 0–1 (TP=2).
 #   2. Waits for the server health endpoint to respond (up to 120s).
-#   3. Launches the GRPOTrainer accelerate job on GPUs 1–7.
+#   3. Launches the GRPOTrainer accelerate job on GPUs 2–7.
 #   4. On exit (normal or Ctrl-C), kills the vLLM server process.
 #
 # Usage:
@@ -49,13 +51,14 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ---------------------------------------------------------------------------
-# Step 1: Start vLLM server on GPU 0 (TP=1)
+# Step 1: Start vLLM server on GPUs 0–1 (TP=2)
 # ---------------------------------------------------------------------------
-echo "=== Phase 3: GRPO Training (1/7 GPU split) ==="
+echo "=== Phase 3: GRPO Training (2/6 GPU split) ==="
 echo ""
-echo "--- Starting vLLM server on GPU 0 (TP=1) ---"
-CUDA_VISIBLE_DEVICES=0 trl vllm-serve \
+echo "--- Starting vLLM server on GPUs 0–1 (TP=2) ---"
+CUDA_VISIBLE_DEVICES=0,1 trl vllm-serve \
     --model "${MODEL}" \
+    --tensor-parallel-size 2 \
     --max-model-len "${MAX_MODEL_LEN}" \
     --gpu-memory-utilization "${GPU_UTIL}" \
     --port "${VLLM_PORT}" \
@@ -84,11 +87,11 @@ done
 echo "vLLM server is healthy at http://localhost:${VLLM_PORT}"
 
 # ---------------------------------------------------------------------------
-# Step 3: Launch GRPOTrainer on GPUs 1–7
+# Step 3: Launch GRPOTrainer on GPUs 2–7
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- Launching GRPOTrainer on GPUs 1–7 (DeepSpeed ZeRO-2, 7-way DDP) ---"
-CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 accelerate launch \
+echo "--- Launching GRPOTrainer on GPUs 2–7 (DeepSpeed ZeRO-2, 6-way DDP) ---"
+CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 accelerate launch \
     --config_file=accelerate_config_grpo.yaml \
     scripts/train_grpo.py \
     training=grpo_trl \

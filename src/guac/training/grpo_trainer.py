@@ -1,8 +1,8 @@
 """GRPO trainer wrapper using TRL's GRPOTrainer in vLLM Server Mode.
 
-Architecture: 1/7 GPU split.
-  - GPU 0:    vLLM generation server (TP=1; 7B model fits in 14 GB << 48 GB).
-  - GPUs 1–7: This process — GRPOTrainer with DeepSpeed ZeRO-2 (LoRA r=8).
+Architecture: 2/6 GPU split.
+  - GPUs 0–1: vLLM generation server (TP=2; doubles KV-cache for 96 concurrent seqs).
+  - GPUs 2–7: This process — GRPOTrainer with DeepSpeed ZeRO-2 (LoRA r=8).
 
 Curriculum updates happen at the *epoch* level rather than per-step.  After
 each ``steps_per_epoch`` optimizer steps, ``R_avg`` is read from the trainer's
@@ -271,7 +271,7 @@ class GUACGRPOTrainer:
 
             trainer = CustomGRPOTrainer(
                 model=str(self.cfg.model.name),
-                reward_funcs=[self._make_reward_fn(), self._make_format_reward_fn()],
+                reward_funcs=[self._make_reward_fn()],
                 args=grpo_config,
                 train_dataset=train_dataset,
                 peft_config=self.peft_config,
@@ -290,7 +290,7 @@ class GUACGRPOTrainer:
             # --------------------------------------------------------------
             # Step 4: Extract R_avg and update curriculum T
             # --------------------------------------------------------------
-            R_avg = self._extract_avg_reward(trainer)
+            R_avg = self._extract_avg_reward(trainer, steps_per_epoch)
             self.curriculum.update(R_avg)
             logger.info(
                 "Epoch %d complete | R_avg=%.4f | T_new=%.4f",
@@ -572,24 +572,43 @@ class GUACGRPOTrainer:
         return valid_ckpts[-1] if valid_ckpts else None
 
     @staticmethod
-    def _extract_avg_reward(trainer: GRPOTrainer) -> float:
-        """Extract the mean reward over the epoch from the trainer's log history.
+    def _extract_avg_reward(
+        trainer: GRPOTrainer, steps_per_epoch: int
+    ) -> float:
+        """Extract the mean reward over the *current* epoch from log history.
 
-        ``GRPOTrainer`` logs ``train/reward`` (or ``reward``) to
-        ``trainer.state.log_history`` at every ``logging_steps`` steps.  We
-        average all reward entries from the most recent epoch.
+        ``GRPOTrainer`` logs ``reward`` (or ``train/reward``) to
+        ``trainer.state.log_history`` at every ``logging_steps`` steps.
+        When resuming from a checkpoint, the log history contains entries
+        from **all** previous epochs.  We filter to only the entries whose
+        ``step`` falls within the current epoch's range::
 
-        Falls back to 0.0 if no reward entries are found (e.g. on a very short
-        smoke-test run where no logging step fired).
+            (global_step - steps_per_epoch, global_step]
+
+        This ensures the curriculum update responds to current-epoch
+        performance rather than a lagged historical average.
+
+        Falls back to 0.0 if no reward entries are found (e.g. on a very
+        short smoke-test run where no logging step fired).
 
         Args:
-            trainer: A ``GRPOTrainer`` instance after ``.train()`` has returned.
+            trainer: A ``GRPOTrainer`` instance after ``.train()`` has
+                     returned.
+            steps_per_epoch: Number of optimizer steps in one curriculum
+                             epoch.  Used to compute the step-range filter.
 
         Returns:
-            Float mean reward, or 0.0 if no entries were logged.
+            Float mean reward for the current epoch, or 0.0 if no entries
+            were logged.
         """
+        current_step = trainer.state.global_step
+        epoch_start = current_step - steps_per_epoch
+
         reward_values = []
         for entry in trainer.state.log_history:
+            step = entry.get("step", 0)
+            if step <= epoch_start:
+                continue  # belongs to a previous epoch
             # TRL 1.x logs 'reward' directly; older versions may use 'train/reward'
             for key in ("reward", "train/reward"):
                 if key in entry:
@@ -598,8 +617,10 @@ class GUACGRPOTrainer:
 
         if not reward_values:
             logger.warning(
-                "No reward entries found in trainer log history. "
-                "Returning R_avg=0.0.  This is normal on a 1-step smoke test."
+                "No reward entries found in trainer log history for "
+                "steps (%d, %d].  Returning R_avg=0.0.  "
+                "This is normal on a 1-step smoke test.",
+                epoch_start, current_step,
             )
             return 0.0
 
