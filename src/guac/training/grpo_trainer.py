@@ -534,7 +534,7 @@ class GUACGRPOTrainer:
             # KL penalty coefficient.  TRL default is 0.04 (GRPO paper value),
             # but 0.1 better prevents rapid policy divergence on VLMs where the
             # reward signal is sparse early in training.
-            beta=float(tcfg.get("beta", 0.1)),
+            beta=float(tcfg.get("grpo_beta", 0.1)),
 
             # On-policy: use each group of completions for exactly 1 gradient
             # update.  num_iterations > 1 would make GRPO off-policy.

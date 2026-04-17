@@ -43,7 +43,7 @@ top_p: 0.9
 # KL penalty coefficient.  Controls how far the policy is allowed to drift
 # from the frozen reference model.  TRL default is 0.04 (GRPO paper).
 # We use 0.1 — higher values prevent rapid mode collapse on sparse rewards.
-beta: 0.1
+grpo_beta: 0.1
 
 # ---------------------------------------------------------------------------
 # Curriculum (shared with REINFORCE — Equations 1 & 2 from the paper)
