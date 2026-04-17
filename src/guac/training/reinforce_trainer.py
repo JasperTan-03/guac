@@ -32,7 +32,12 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import wandb
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
@@ -282,7 +287,7 @@ class ReinforceTrainer:
         # W&B (rank 0 only)
         # ------------------------------------------------------------------
         self._wandb_run = None
-        if self.is_main:
+        if self.is_main and _WANDB_AVAILABLE:
             wandb_kwargs: Dict[str, Any] = {
                 "project": str(tcfg.get("wandb_project", "guac")),
                 "config": OmegaConf.to_container(cfg, resolve=True),

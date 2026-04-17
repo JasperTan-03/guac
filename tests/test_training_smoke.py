@@ -81,14 +81,20 @@ def _tiny_model_available() -> bool:
         return False
 
 
+def _torchvision_available() -> bool:
+    try:
+        import torchvision  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 _requires_tiny_model = pytest.mark.skipif(
-    not _tiny_model_available(),
+    not _tiny_model_available() or not _torchvision_available(),
     reason=(
-        f"Tiny test model {TINY_MODEL!r} is not available in the local "
-        "HF cache and the Hub is unreachable.  Pre-download it with "
-        "`python -c \"from transformers import AutoModelForVision2Seq; "
-        f"AutoModelForVision2Seq.from_pretrained('{TINY_MODEL}')\"`, "
-        "or unset HF_HUB_OFFLINE to allow a network fetch."
+        f"Tiny test model {TINY_MODEL!r} requires both a resolvable HF "
+        "checkpoint and torchvision.  Install torchvision or pre-download "
+        "the model to enable these tests."
     ),
 )
 

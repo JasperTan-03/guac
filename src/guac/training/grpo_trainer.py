@@ -42,7 +42,12 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-import wandb
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 import datasets as hf_datasets
 from omegaconf import DictConfig, OmegaConf
 from peft import LoraConfig, TaskType
@@ -158,7 +163,7 @@ class GUACGRPOTrainer:
         # W&B (rank 0 only — TRL also logs to W&B, but we need extra metrics)
         # ------------------------------------------------------------------
         self._wandb_run = None
-        if self._is_main:
+        if self._is_main and _WANDB_AVAILABLE:
             wandb_kwargs: Dict[str, Any] = {
                 "project": str(tcfg.get("wandb_project", "guac")),
                 "config": OmegaConf.to_container(cfg, resolve=True),
@@ -201,9 +206,10 @@ class GUACGRPOTrainer:
         per_device_batch = int(tcfg.per_device_train_batch_size)
         num_generations = int(tcfg.num_generations)
         # How many unique prompts to include in each epoch-dataset.
-        # 4 training GPUs × per_device_batch × steps_per_epoch gives the
-        # total prompt slots; we provide 2× for shuffling headroom.
-        epoch_dataset_size = per_device_batch * steps_per_epoch * 4
+        # world_size × per_device_batch × steps_per_epoch gives the total
+        # prompt slots consumed; we provide 2× headroom for shuffling.
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        epoch_dataset_size = per_device_batch * steps_per_epoch * world_size * 2
 
         for epoch in range(1, num_epochs + 1):
             logger.info(
@@ -325,7 +331,10 @@ class GUACGRPOTrainer:
 
         prompts: List[List[Dict[str, Any]]] = []
         answers: List[str] = []
-        images: List[Optional[Any]] = []
+        # TRL's prepare_multimodal_messages calls len() on each row's images
+        # value, so each entry must be a list of PIL images (not a bare image).
+        # Text-only examples use an empty list.
+        images: List[List[Any]] = []
 
         for idx in indices:
             record = self.records[idx]
@@ -349,13 +358,9 @@ class GUACGRPOTrainer:
 
             prompts.append(conversation)
             answers.append(answer)
-            images.append(pil_image)
+            images.append([pil_image] if pil_image is not None else [])
 
-        has_images = any(img is not None for img in images)
-        data: Dict[str, List[Any]] = {"prompt": prompts, "answer": answers}
-        if has_images:
-            data["images"] = images
-
+        data: Dict[str, List[Any]] = {"prompt": prompts, "answer": answers, "images": images}
         return hf_datasets.Dataset.from_dict(data)
 
     def _make_reward_fn(self):

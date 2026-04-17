@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Start the vLLM generation server on GPUs 0–3 (Tensor Parallelism = 4).
+# Start the vLLM generation server on GPU 0 (TP=1).
+#
+# The 7B model (~14 GB) fits on a single A6000 (48 GB) — no tensor parallelism
+# needed.  TP=1 avoids inter-GPU all-reduce overhead on every forward pass.
 #
 # This must be running BEFORE launching the training job.
 # The server will be ready when you see:
@@ -26,14 +29,13 @@ echo "  Model:          ${MODEL}"
 echo "  Port:           ${VLLM_PORT}"
 echo "  Max model len:  ${MAX_MODEL_LEN}"
 echo "  GPU util:       ${GPU_UTIL}"
-echo "  GPUs:           0,1,2,3 (TP=4)"
+echo "  GPUs:           0 (TP=1)"
 echo ""
 echo "Wait for 'Application startup complete' before launching training."
 echo ""
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 trl vllm-serve \
+CUDA_VISIBLE_DEVICES=0 trl vllm-serve \
     --model "${MODEL}" \
-    --tensor-parallel-size 4 \
     --max-model-len "${MAX_MODEL_LEN}" \
     --gpu-memory-utilization "${GPU_UTIL}" \
     --port "${VLLM_PORT}" \
