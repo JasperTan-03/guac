@@ -7,8 +7,8 @@ output_dir: checkpoints
 # 4 × 8 × 5 = 160 rollouts per micro-step (fits TP=2 vLLM capacity).
 # Effective batch per optimizer step: 4 × 8 × 4 × 5 = 640 reward signals.
 # GRPO benefits from within-group reward variance; keep num_generations >= 8.
-per_device_train_batch_size: 8
-num_generations: 16            # G — responses generated per prompt
+per_device_train_batch_size: 16
+num_generations: 64 # G — responses generated per prompt
 gradient_accumulation_steps: 4
 learning_rate: 2e-5
 weight_decay: 0.01
@@ -26,7 +26,7 @@ log_steps: 10
 # dataset, and repeat.  This is equivalent to Equation 1 applied at epoch
 # granularity rather than per-step.
 num_epochs: 10                # number of curriculum epochs
-steps_per_epoch: 100 # optimizer steps per curriculum epoch
+steps_per_epoch: 5 # optimizer steps per curriculum epoch
 
 # ---------------------------------------------------------------------------
 # Generation (vLLM server)

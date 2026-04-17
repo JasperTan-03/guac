@@ -35,6 +35,8 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from tqdm import tqdm
+
 # Suppress spurious vLLM version warning from TRL import (harmless with 0.19.x)
 warnings.filterwarnings(
     "ignore",
@@ -220,6 +222,13 @@ class GUACGRPOTrainer:
         """
         from transformers import TrainerCallback
 
+        # Silence verbose library logging on all non-main ranks so the
+        # tqdm bar on rank-0 is the primary source of progress information.
+        if not self._is_main:
+            logging.getLogger("transformers").setLevel(logging.WARNING)
+            logging.getLogger("trl").setLevel(logging.WARNING)
+            logging.getLogger("accelerate").setLevel(logging.WARNING)
+
         tcfg = self.cfg.training
         num_epochs = int(tcfg.num_epochs)
         steps_per_epoch = int(tcfg.steps_per_epoch)
@@ -231,20 +240,30 @@ class GUACGRPOTrainer:
         epoch_dataset_size = per_device_batch * steps_per_epoch * world_size * 2
         total_max_steps = num_epochs * steps_per_epoch
 
-        for epoch in range(1, num_epochs + 1):
-            logger.info(
-                "=== Curriculum Epoch %d/%d | T=%.4f ===",
-                epoch, num_epochs, self.curriculum.T,
+        # Single tqdm bar for the entire training run (main process only).
+        pbar = (
+            tqdm(
+                total=total_max_steps,
+                desc="Training",
+                unit="step",
+                dynamic_ncols=True,
+                position=0,
+                leave=True,
             )
+            if self._is_main
+            else None
+        )
+        # Track how many steps have been completed so far (for bar increments).
+        _steps_done = [0]  # list so the closure can mutate it
+
+        for epoch in range(1, num_epochs + 1):
+            if self._is_main and pbar is not None:
+                pbar.set_description(f"Epoch {epoch}/{num_epochs} (T={self.curriculum.T:.3f})")
 
             # --------------------------------------------------------------
             # Step 1: Build curriculum-sampled dataset for this epoch
             # --------------------------------------------------------------
             train_dataset = self._build_epoch_dataset(epoch_dataset_size)
-            logger.info(
-                "Epoch %d dataset: %d examples (T=%.4f, mode=%s)",
-                epoch, len(train_dataset), self.curriculum.T, tcfg.sampling_mode,
-            )
 
             # --------------------------------------------------------------
             # Step 2: Build GRPOConfig and GRPOTrainer
@@ -263,9 +282,30 @@ class GUACGRPOTrainer:
             # remaining steps (e.g., epoch 2 resumes at step 100 and stops
             # at step 200 — 100 new steps).
             target_step_closure = target_step
+            is_main = self._is_main
+            pbar_ref = pbar
+            steps_done_ref = _steps_done
 
             class EpochStopCallback(TrainerCallback):
                 def on_step_end(self, args, state, control, **kwargs):
+                    # Update tqdm on the main process.
+                    if is_main and pbar_ref is not None:
+                        new_total = state.global_step
+                        increment = new_total - steps_done_ref[0]
+                        if increment > 0:
+                            # Pull latest reward from log history for postfix.
+                            reward = None
+                            for entry in reversed(state.log_history):
+                                for key in ("reward", "train/reward"):
+                                    if key in entry:
+                                        reward = entry[key]
+                                        break
+                                if reward is not None:
+                                    break
+                            postfix = {"reward": f"{reward:.4f}"} if reward is not None else {}
+                            pbar_ref.update(increment)
+                            pbar_ref.set_postfix(postfix)
+                            steps_done_ref[0] = new_total
                     if state.global_step >= target_step_closure:
                         control.should_training_stop = True
 
@@ -282,7 +322,8 @@ class GUACGRPOTrainer:
             # Step 3: Train for steps_per_epoch steps
             # --------------------------------------------------------------
             if resume_path is not None:
-                logger.info("Resuming from checkpoint: %s", resume_path)
+                if self._is_main:
+                    logger.info("Resuming from checkpoint: %s", resume_path)
                 trainer.train(resume_from_checkpoint=str(resume_path))
             else:
                 trainer.train()
@@ -292,10 +333,11 @@ class GUACGRPOTrainer:
             # --------------------------------------------------------------
             R_avg = self._extract_avg_reward(trainer, steps_per_epoch)
             self.curriculum.update(R_avg)
-            logger.info(
-                "Epoch %d complete | R_avg=%.4f | T_new=%.4f",
-                epoch, R_avg, self.curriculum.T,
-            )
+
+            if self._is_main and pbar is not None:
+                pbar.set_description(
+                    f"Epoch {epoch}/{num_epochs} done | R_avg={R_avg:.4f} | T={self.curriculum.T:.3f}"
+                )
 
             # Log curriculum metrics to W&B
             if self._is_main and self._wandb_run is not None:
@@ -318,12 +360,13 @@ class GUACGRPOTrainer:
             ckpt_dir = self.output_dir / f"epoch_{epoch:04d}"
             if self._is_main:
                 trainer.save_model(str(ckpt_dir))
-                logger.info("Checkpoint saved: %s", ckpt_dir)
             trainer.save_state()  # all ranks; non-zero ranks return immediately
 
         # ------------------------------------------------------------------
         # Final checkpoint
         # ------------------------------------------------------------------
+        if pbar is not None:
+            pbar.close()
         if self._is_main:
             final_dir = self.output_dir / "final"
             final_dir.mkdir(parents=True, exist_ok=True)
@@ -543,9 +586,12 @@ class GUACGRPOTrainer:
             # Precision (A6000s support bf16)
             bf16=True,
 
-            # Logging
+            # Logging — only log to W&B; suppress TRL's own console progress
+            # bar and step-level prints so the tqdm bar is the sole output.
             logging_steps=int(tcfg.log_steps),
             save_steps=int(tcfg.save_steps),
+            disable_tqdm=True,
+            log_on_each_node=False,
 
             # Report to W&B (TRL logs train/* metrics natively)
             report_to="wandb" if self._is_main else "none",
