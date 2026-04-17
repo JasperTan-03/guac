@@ -4,11 +4,11 @@ output_dir: checkpoints
 # Batch / optimisation
 # ---------------------------------------------------------------------------
 # per_device_train_batch_size × num_generations × world_size = rollouts/micro-step
-# 2 × 8 × 6 = 96 rollouts per micro-step (fits TP=2 vLLM capacity).
-# Effective batch per optimizer step: 2 × 8 × 4 × 6 = 384 reward signals.
+# 4 × 8 × 5 = 160 rollouts per micro-step (fits TP=2 vLLM capacity).
+# Effective batch per optimizer step: 4 × 8 × 4 × 5 = 640 reward signals.
 # GRPO benefits from within-group reward variance; keep num_generations >= 8.
-per_device_train_batch_size: 2
-num_generations: 8            # G — responses generated per prompt
+per_device_train_batch_size: 8
+num_generations: 16            # G — responses generated per prompt
 gradient_accumulation_steps: 4
 learning_rate: 2e-5
 weight_decay: 0.01
