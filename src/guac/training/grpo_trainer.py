@@ -58,6 +58,23 @@ from guac.data.utils import decode_image
 from guac.training.curriculum import CurriculumSampler, CurriculumState
 from guac.training.rewards import compute_reward
 
+class CustomGRPOTrainer(GRPOTrainer):
+    def create_optimizer(self):
+        """Override to filter out empty parameter groups (e.g., no_decay group in LoRA).
+        
+        DeepSpeed ZeRO-2 drops empty parameter groups automatically. If the Trainer
+        creates an empty group (e.g., for biases/LayerNorms when only LoRA is active),
+        DeepSpeed drops it, but the LR scheduler expects the original number of groups,
+        causing a `ValueError: zip() argument 2 is longer than argument 1`.
+        """
+        optimizer = super().create_optimizer()
+        if optimizer is not None:
+            # Filter out any parameter groups that have no parameters
+            optimizer.param_groups = [
+                group for group in optimizer.param_groups if len(group["params"]) > 0
+            ]
+        return optimizer
+
 logger = logging.getLogger(__name__)
 
 # System prompt injected at the start of every conversation turn.
@@ -243,7 +260,7 @@ class GUACGRPOTrainer:
                     if state.global_step >= target_step:
                         control.should_training_stop = True
 
-            trainer = GRPOTrainer(
+            trainer = CustomGRPOTrainer(
                 model=str(self.cfg.model.name),
                 reward_funcs=[self._make_reward_fn()],
                 args=grpo_config,
@@ -376,12 +393,17 @@ class GUACGRPOTrainer:
         Returns:
             Callable with signature ``(completions, **kwargs) -> List[float]``.
         """
-        def reward_fn(completions: List[str], **kwargs) -> List[float]:
+        def reward_fn(completions: List[Any], **kwargs) -> List[float]:
             answers = kwargs.get("answer", [])
-            return [
-                compute_reward(completion, gt)
-                for completion, gt in zip(completions, answers)
-            ]
+            rewards = []
+            for completion, gt in zip(completions, answers):
+                # TRL conversational format passes completions as message dicts
+                if isinstance(completion, list) and len(completion) > 0 and isinstance(completion[0], dict):
+                    completion_text = completion[-1].get("content", "")
+                else:
+                    completion_text = str(completion)
+                rewards.append(compute_reward(completion_text, gt))
+            return rewards
 
         return reward_fn
 

@@ -8,7 +8,7 @@ output_dir: checkpoints
 # GRPO benefits from within-group reward variance; keep num_generations >= 8.
 per_device_train_batch_size: 1
 num_generations: 8            # G — responses generated per prompt
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 8
 learning_rate: 2e-5
 weight_decay: 0.01
 max_grad_norm: 1.0
