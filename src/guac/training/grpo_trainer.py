@@ -444,13 +444,15 @@ class GUACGRPOTrainer:
         """Return the most recent epoch checkpoint dir, or None on first epoch.
 
         Looks for ``epoch_NNNN`` subdirs in ``self.output_dir`` and returns
-        the lexicographically last one (which is the numerically largest).
+        the lexicographically last one (which is the numerically largest)
+        that contains a valid trainer_state.json.
 
         Returns:
             Path to the latest checkpoint directory, or None if none exist.
         """
         ckpts = sorted(self.output_dir.glob("epoch_????"))
-        return ckpts[-1] if ckpts else None
+        valid_ckpts = [c for c in ckpts if (c / "trainer_state.json").is_file()]
+        return valid_ckpts[-1] if valid_ckpts else None
 
     @staticmethod
     def _extract_avg_reward(trainer: GRPOTrainer) -> float:

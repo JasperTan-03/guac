@@ -23,7 +23,7 @@ machine_rank: 0
 main_training_function: main
 downcast_bf16: 'no'
 deepspeed_config:
-  gradient_accumulation_steps: 1    # Overridden at runtime by GRPOConfig
+  gradient_accumulation_steps: 4    # Matches hf gradient_accumulation_steps=4
   gradient_clipping: 1.0
   offload_optimizer_device: none    # Keep optimizer states on GPU (no CPU offload)
   offload_param_device: none        # Keep params on GPU
