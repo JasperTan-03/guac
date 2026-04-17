@@ -50,15 +50,13 @@ trap cleanup EXIT INT TERM
 echo "=== Phase 3: GRPO Training (4/4 GPU split) ==="
 echo ""
 echo "--- Starting vLLM server on GPUs 0–3 (TP=4) ---"
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m vllm.entrypoints.openai.api_server \
+CUDA_VISIBLE_DEVICES=0,1,2,3 trl vllm-serve \
     --model "${MODEL}" \
     --tensor-parallel-size 4 \
     --max-model-len "${MAX_MODEL_LEN}" \
     --gpu-memory-utilization "${GPU_UTIL}" \
     --port "${VLLM_PORT}" \
-    --trust-remote-code \
-    --served-model-name "policy" \
-    --generation-config vllm &
+    --trust-remote-code &
 VLLM_PID=$!
 echo "vLLM server PID: ${VLLM_PID}"
 

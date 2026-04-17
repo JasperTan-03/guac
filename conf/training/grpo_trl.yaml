@@ -30,7 +30,7 @@ steps_per_epoch: 100 # optimizer steps per curriculum epoch
 # ---------------------------------------------------------------------------
 # Generation (vLLM server)
 # ---------------------------------------------------------------------------
-vllm_server_host: "0.0.0.0"
+vllm_server_host: "127.0.0.1"
 vllm_server_port: 8000
 max_model_len: 4096           # max tokens for vLLM server (prompt + completion)
 max_completion_length: 512    # max generated tokens per rollout
