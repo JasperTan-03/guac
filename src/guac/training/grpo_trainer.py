@@ -1,8 +1,8 @@
 """GRPO trainer wrapper using TRL's GRPOTrainer in vLLM Server Mode.
 
-Architecture: 4/4 GPU split.
-  - GPUs 0–3: vLLM server (TP=4) — handles generation (started externally).
-  - GPUs 4–7: This process — GRPOTrainer with DeepSpeed ZeRO-2 (LoRA r=8).
+Architecture: 1/7 GPU split.
+  - GPU 0:    vLLM generation server (TP=1; 7B model fits in 14 GB << 48 GB).
+  - GPUs 1–7: This process — GRPOTrainer with DeepSpeed ZeRO-2 (LoRA r=8).
 
 Curriculum updates happen at the *epoch* level rather than per-step.  After
 each ``steps_per_epoch`` optimizer steps, ``R_avg`` is read from the trainer's
@@ -215,8 +215,10 @@ class GUACGRPOTrainer:
           2. Build a fresh GRPOTrainer and train for steps_per_epoch steps.
           3. Read R_avg from the trainer's log history.
           4. Update curriculum T (Equation 1).
-          5. Save a LoRA checkpoint.
+          5. Save a LoRA checkpoint + trainer state (required for resume).
         """
+        from transformers import TrainerCallback
+
         tcfg = self.cfg.training
         num_epochs = int(tcfg.num_epochs)
         steps_per_epoch = int(tcfg.steps_per_epoch)
@@ -227,6 +229,7 @@ class GUACGRPOTrainer:
         # prompt slots consumed; we provide 2× headroom for shuffling.
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         epoch_dataset_size = per_device_batch * steps_per_epoch * world_size * 2
+        total_max_steps = num_epochs * steps_per_epoch
 
         for epoch in range(1, num_epochs + 1):
             logger.info(
@@ -246,18 +249,24 @@ class GUACGRPOTrainer:
             # --------------------------------------------------------------
             # Step 2: Build GRPOConfig and GRPOTrainer
             # --------------------------------------------------------------
+            # _latest_checkpoint() requires trainer_state.json — see Step 5.
             resume_path = self._latest_checkpoint()
-            total_max_steps = num_epochs * steps_per_epoch
             target_step = epoch * steps_per_epoch
 
             grpo_config = self._build_grpo_config(
                 epoch=epoch, max_steps=total_max_steps,
             )
 
-            from transformers import TrainerCallback
+            # EpochStopCallback halts training once global_step reaches the
+            # target for this epoch.  On resume, global_step is loaded from
+            # trainer_state.json, so the callback correctly runs only the
+            # remaining steps (e.g., epoch 2 resumes at step 100 and stops
+            # at step 200 — 100 new steps).
+            target_step_closure = target_step
+
             class EpochStopCallback(TrainerCallback):
                 def on_step_end(self, args, state, control, **kwargs):
-                    if state.global_step >= target_step:
+                    if state.global_step >= target_step_closure:
                         control.should_training_stop = True
 
             trainer = CustomGRPOTrainer(
@@ -302,10 +311,15 @@ class GUACGRPOTrainer:
             # --------------------------------------------------------------
             # Step 5: Save epoch checkpoint
             # --------------------------------------------------------------
+            # save_model writes the LoRA adapter weights (rank 0 only for ZeRO-2).
+            # save_state writes trainer_state.json (global_step etc.) to the same
+            # directory — this is what _latest_checkpoint() checks for, and what
+            # resume_from_checkpoint reads to restore global_step in the next epoch.
             ckpt_dir = self.output_dir / f"epoch_{epoch:04d}"
             if self._is_main:
                 trainer.save_model(str(ckpt_dir))
                 logger.info("Checkpoint saved: %s", ckpt_dir)
+            trainer.save_state()  # all ranks; non-zero ranks return immediately
 
         # ------------------------------------------------------------------
         # Final checkpoint

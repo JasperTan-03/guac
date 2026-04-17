@@ -4,7 +4,7 @@ output_dir: checkpoints
 # Batch / optimisation
 # ---------------------------------------------------------------------------
 # per_device_train_batch_size × num_generations × world_size = rollouts/step
-# 1 × 8 × 4 = 32 rollouts per optimizer step (vs 8 for REINFORCE).
+# 1 × 8 × 7 = 56 rollouts per optimizer step (vs 8 for REINFORCE).
 # GRPO benefits from within-group reward variance; keep num_generations >= 8.
 per_device_train_batch_size: 1
 num_generations: 8            # G — responses generated per prompt
