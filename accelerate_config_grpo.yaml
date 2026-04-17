@@ -1,0 +1,31 @@
+# HuggingFace accelerate config for the GRPO *training* job.
+#
+# This targets 4 GPUs (GPUs 4–7 via CUDA_VISIBLE_DEVICES=4,5,6,7 set in the
+# launch script).  Generation is handled by a separate vLLM server running on
+# GPUs 0–3 — do NOT run both processes on all 8 GPUs simultaneously; the VRAM
+# fragmentation will cause OOM during the rollout phase.
+#
+# DeepSpeed ZeRO-2 shards optimizer states and gradients across the 4 training
+# GPUs.  ZeRO-3 is unnecessary because LoRA (r=8) keeps the trainable parameter
+# count tiny (~20M vs 7B total); ZeRO-2 is simpler and faster for this ratio.
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=4,5,6,7 accelerate launch \
+#       --config_file=accelerate_config_grpo.yaml \
+#       scripts/train_grpo.py [overrides...]
+compute_environment: LOCAL_MACHINE
+distributed_type: DEEPSPEED
+num_processes: 4
+num_machines: 1
+mixed_precision: bf16
+use_cpu: false
+machine_rank: 0
+main_training_function: main
+downcast_bf16: 'no'
+deepspeed_config:
+  gradient_accumulation_steps: 1    # Overridden at runtime by GRPOConfig
+  gradient_clipping: 1.0
+  offload_optimizer_device: none    # Keep optimizer states on GPU (no CPU offload)
+  offload_param_device: none        # Keep params on GPU
+  zero3_init_flag: false
+  zero_stage: 2
