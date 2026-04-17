@@ -255,6 +255,9 @@ class GUACGRPOTrainer:
         )
         # Track how many steps have been completed so far (for bar increments).
         _steps_done = [0]  # list so the closure can mutate it
+        # Keep reference to the previous epoch's trainer so we can tear down
+        # its vLLM communicator before a new one is opened.
+        _prev_trainer = [None]  # list so the closure can hold the ref
 
         for epoch in range(1, num_epochs + 1):
             if self._is_main and pbar is not None:
@@ -268,32 +271,28 @@ class GUACGRPOTrainer:
             # --------------------------------------------------------------
             # Step 2: Build GRPOConfig and GRPOTrainer
             # --------------------------------------------------------------
-            # _latest_checkpoint() requires trainer_state.json — see Step 5.
-            resume_path = self._latest_checkpoint()
-            target_step = epoch * steps_per_epoch
+            # Load the previous epoch's LoRA adapter so weights carry forward.
+            # We cannot resume a DeepSpeed checkpoint (those files aren't saved);
+            # instead we load the PEFT adapter saved by save_model() at the end
+            # of the previous epoch.  For epoch 1 there is no prior adapter.
+            prev_ckpt = self._latest_checkpoint()
 
             grpo_config = self._build_grpo_config(
-                epoch=epoch, max_steps=total_max_steps,
+                epoch=epoch, max_steps=steps_per_epoch,
             )
 
-            # EpochStopCallback halts training once global_step reaches the
-            # target for this epoch.  On resume, global_step is loaded from
-            # trainer_state.json, so the callback correctly runs only the
-            # remaining steps (e.g., epoch 2 resumes at step 100 and stops
-            # at step 200 — 100 new steps).
-            target_step_closure = target_step
+            # tqdm update callback — max_steps=steps_per_epoch means the
+            # trainer stops automatically; no manual stop logic required.
             is_main = self._is_main
             pbar_ref = pbar
             steps_done_ref = _steps_done
 
-            class EpochStopCallback(TrainerCallback):
+            class StepCallback(TrainerCallback):
                 def on_step_end(self, args, state, control, **kwargs):
-                    # Update tqdm on the main process.
                     if is_main and pbar_ref is not None:
-                        new_total = state.global_step
-                        increment = new_total - steps_done_ref[0]
+                        new_total = steps_done_ref[0] + state.global_step
+                        increment = new_total - pbar_ref.n
                         if increment > 0:
-                            # Pull latest reward from log history for postfix.
                             reward = None
                             for entry in reversed(state.log_history):
                                 for key in ("reward", "train/reward"):
@@ -305,28 +304,66 @@ class GUACGRPOTrainer:
                             postfix = {"reward": f"{reward:.4f}"} if reward is not None else {}
                             pbar_ref.update(increment)
                             pbar_ref.set_postfix(postfix)
-                            steps_done_ref[0] = new_total
-                    if state.global_step >= target_step_closure:
-                        control.should_training_stop = True
+
+            # ---------------------------------------------------------------
+            # Close the previous epoch's vLLM communicator BEFORE creating a
+            # new GRPOTrainer.  Each trainer's __init__ calls
+            # vllm_client.init_communicator() on the server; the server raises
+            # "Weight update group already initialized" if the previous NCCL
+            # group is still open.
+            # ---------------------------------------------------------------
+            if _prev_trainer[0] is not None:
+                prev = _prev_trainer[0]
+                try:
+                    if (
+                        self._is_main
+                        and hasattr(prev, "vllm_generation")
+                        and hasattr(prev.vllm_generation, "vllm_client")
+                    ):
+                        prev.vllm_generation.vllm_client.close_communicator()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("close_communicator raised (ignored): %s", exc)
+                # Let all ranks synchronise so rank-0 has finished closing
+                # before any rank proceeds to init_communicator again.
+                if hasattr(prev, "accelerator"):
+                    prev.accelerator.wait_for_everyone()
+                _prev_trainer[0] = None
+                del prev
+
+            # If a saved LoRA adapter exists from the previous epoch, load it
+            # so training continues from where it left off.  Otherwise start
+            # from the base HuggingFace model with a fresh LoRA init.
+            if prev_ckpt is not None:
+                import torch
+                from peft import PeftModel
+                from transformers import AutoModelForVision2Seq
+
+                base = AutoModelForVision2Seq.from_pretrained(
+                    str(self.cfg.model.name),
+                    torch_dtype=torch.bfloat16,
+                    device_map=None,  # DeepSpeed handles placement
+                )
+                model_arg = PeftModel.from_pretrained(base, str(prev_ckpt))
+                peft_config_arg = None  # already a PeftModel; skip re-wrapping
+            else:
+                model_arg = str(self.cfg.model.name)
+                peft_config_arg = self.peft_config
 
             trainer = CustomGRPOTrainer(
-                model=str(self.cfg.model.name),
+                model=model_arg,
                 reward_funcs=[self._make_reward_fn()],
                 args=grpo_config,
                 train_dataset=train_dataset,
-                peft_config=self.peft_config,
-                callbacks=[EpochStopCallback()],
+                peft_config=peft_config_arg,
+                callbacks=[StepCallback()],
             )
+            _prev_trainer[0] = trainer
 
             # --------------------------------------------------------------
-            # Step 3: Train for steps_per_epoch steps
+            # Step 3: Train for steps_per_epoch steps (max_steps handles stop)
             # --------------------------------------------------------------
-            if resume_path is not None:
-                if self._is_main:
-                    logger.info("Resuming from checkpoint: %s", resume_path)
-                trainer.train(resume_from_checkpoint=str(resume_path))
-            else:
-                trainer.train()
+            trainer.train()
+            _steps_done[0] += steps_per_epoch
 
             # --------------------------------------------------------------
             # Step 4: Extract R_avg and update curriculum T
@@ -551,7 +588,8 @@ class GUACGRPOTrainer:
             # Output
             output_dir=epoch_output,
 
-            # Batch size / steps
+            # Batch size / steps — max_steps is set to steps_per_epoch so
+            # each trainer instance runs for exactly one curriculum epoch.
             per_device_train_batch_size=int(tcfg.per_device_train_batch_size),
             gradient_accumulation_steps=int(tcfg.gradient_accumulation_steps),
             max_steps=max_steps,
