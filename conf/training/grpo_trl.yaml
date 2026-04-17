@@ -1,0 +1,65 @@
+output_dir: checkpoints
+
+# ---------------------------------------------------------------------------
+# Batch / optimisation
+# ---------------------------------------------------------------------------
+# per_device_train_batch_size × num_generations × world_size = rollouts/micro-step
+# 4 × 8 × 5 = 160 rollouts per micro-step (fits TP=2 vLLM capacity).
+# Effective batch per optimizer step: 4 × 8 × 4 × 5 = 640 reward signals.
+# GRPO benefits from within-group reward variance; keep num_generations >= 8.
+per_device_train_batch_size: 16
+num_generations: 64 # G — responses generated per prompt
+gradient_accumulation_steps: 4
+learning_rate: 2e-5
+weight_decay: 0.01
+max_grad_norm: 1.0
+warmup_steps: 20
+save_steps: 500
+log_steps: 10
+
+# ---------------------------------------------------------------------------
+# Discrete curriculum epochs
+# ---------------------------------------------------------------------------
+# GRPOTrainer owns the inner training loop, so we cannot inject per-step
+# curriculum updates without subclassing.  Instead we run the trainer for
+# steps_per_epoch steps, read R_avg from log history, update T, rebuild the
+# dataset, and repeat.  This is equivalent to Equation 1 applied at epoch
+# granularity rather than per-step.
+num_epochs: 10                # number of curriculum epochs
+steps_per_epoch: 5 # optimizer steps per curriculum epoch
+
+# ---------------------------------------------------------------------------
+# Generation (vLLM server)
+# ---------------------------------------------------------------------------
+vllm_server_host: "127.0.0.1"
+vllm_server_port: 8000
+max_model_len: 4096           # max tokens for vLLM server (prompt + completion)
+max_completion_length: 512    # max generated tokens per rollout
+temperature: 1.0              # high → diverse rollouts → richer GRPO signal
+top_p: 0.9
+
+# ---------------------------------------------------------------------------
+# GRPO algorithm parameters
+# ---------------------------------------------------------------------------
+# KL penalty coefficient.  Controls how far the policy is allowed to drift
+# from the frozen reference model.  TRL default is 0.04 (GRPO paper).
+# We use 0.1 — higher values prevent rapid mode collapse on sparse rewards.
+grpo_beta: 0.1
+
+# ---------------------------------------------------------------------------
+# Curriculum (shared with REINFORCE — Equations 1 & 2 from the paper)
+# ---------------------------------------------------------------------------
+sampling_mode: gaussian       # baseline | gaussian
+T_init: 0.1
+eta: 0.05
+alpha: 2.0
+beta: 0.5
+sigma: 0.15
+d_min: 0.1
+d_max: 0.7
+
+# ---------------------------------------------------------------------------
+# W&B logging (rank 0 only)
+# ---------------------------------------------------------------------------
+wandb_project: guac
+# wandb_entity: null          # uncomment and set for a team account

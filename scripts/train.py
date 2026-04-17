@@ -1,9 +1,10 @@
-"""GRPO training entrypoint.
+"""REINFORCE training entrypoint.
 
-Trains a LoRA-adapted Qwen2-VL model with GRPO and a dynamic difficulty
-curriculum.  Reads training data from ``data/scored/train.jsonl`` (requires
-Phase 2 to have completed).  Saves LoRA checkpoints every ``save_steps`` steps
-to ``checkpoints/step_{N}/`` and a final checkpoint to ``checkpoints/final/``.
+Trains a LoRA-adapted Qwen2-VL model with REINFORCE + EMA baseline and a
+dynamic difficulty curriculum.  Reads training data from the scored directory
+configured in ``conf/data/default.yaml``.  Saves LoRA checkpoints every
+``save_steps`` steps to ``checkpoints/step_{N}/`` and a final checkpoint to
+``checkpoints/final/``.
 
 Training and curriculum metrics are logged to MLflow at every ``log_steps``
 optimizer steps.
@@ -22,14 +23,14 @@ import os
 import hydra
 from omegaconf import DictConfig
 
-from guac.training.trainer import GRPOTrainer
+from guac.training.reinforce_trainer import ReinforceTrainer
 
 log = logging.getLogger(__name__)
 
 
 @hydra.main(config_path="../conf", config_name="config", version_base="1.2")
 def main(cfg: DictConfig) -> None:
-    """Run the GRPO training loop.
+    """Run the REINFORCE training loop.
 
     Args:
         cfg: Hydra-composed DictConfig from ``conf/config.yaml``.
@@ -42,14 +43,14 @@ def main(cfg: DictConfig) -> None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)
 
     log.info(
-        "Starting GRPO training | model=%s | steps=%d | sampling_mode=%s | gpu_id=%s",
+        "Starting REINFORCE training | model=%s | steps=%d | sampling_mode=%s | gpu_id=%s",
         cfg.model.name,
         cfg.training.num_train_steps,
         cfg.training.sampling_mode,
         cfg.gpu_id,
     )
 
-    trainer = GRPOTrainer(cfg)
+    trainer = ReinforceTrainer(cfg)
     trainer.train()
 
     log.info("Training complete.")

@@ -239,10 +239,13 @@ def compute_reward(prediction: str, ground_truth: str) -> float:
             if _sympy_equivalent(p_cand, g_cand):
                 return 1.0
 
-    # Strategy 4: ground truth appears verbatim in prediction
-    # (guards against false positives from very short strings like "a")
-    if len(gt_norm) >= 3 and gt_norm in pred_norm:
-        return 1.0
+    # Strategy 4: ground truth appears as a whole word/number in prediction.
+    # We require a word-boundary match to avoid false positives like "120"
+    # matching inside "1200" or "12000".  The `re.escape` handles dots and
+    # other special chars in numeric answers.
+    if len(gt_norm) >= 3:
+        if re.search(r"(?<![0-9a-z])" + re.escape(gt_norm) + r"(?![0-9a-z])", pred_norm):
+            return 1.0
 
     return 0.0
 

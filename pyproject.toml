@@ -1,7 +1,7 @@
 [project]
 name = "guac"
 version = "0.1.0"
-description = "VLM RL pipeline: GRPO with dynamic difficulty curriculum"
+description = "VLM RL pipeline: REINFORCE with dynamic difficulty curriculum"
 requires-python = ">=3.11"
 dependencies = [
     # Data
@@ -17,8 +17,9 @@ dependencies = [
     "peft>=0.18.0",
     "accelerate>=1.0",
     "bitsandbytes>=0.49",
+    "deepspeed>=0.14.0",
     # Experiment tracking
-    "mlflow>=2.0",
+    "wandb>=0.18",
     # Symbolic math for AdaRFT-style reward equivalence
     # (compute_reward uses sympy.sympify to check "0.5" == "\\frac{1}{2}")
     "sympy>=1.12",

@@ -479,19 +479,18 @@ class GRPOTrainer:
 
                 batch_raw_rewards.extend(group_rewards)
 
-                # Step 4: Detect flat groups.  If every rollout in this group
-                # got the same reward (all 0 or all 1), normalising would
-                # yield all-zero advantages and the GRPO term for this group
-                # would be exactly 0 — a wasted forward/backward pass.  Skip
-                # it, but still include its rewards in batch_raw_rewards so
-                # the curriculum update sees the true success rate.
+                # Step 4: Detect flat groups.
+                # In distributed training, skipping forward passes on some ranks
+                # causes deadlocks on DDP's broadcast synchronization. We MUST
+                # execute the forward pass for every generated sequence on every
+                # rank. Flat groups receive 0.0 advantages so their gradient
+                # contribution becomes exactly zero.
                 if not is_informative_group(group_rewards):
                     flat_groups += 1
-                    continue
-                informative_groups += 1
-
-                # Step 4 (cont.): Normalise rewards within the informative group.
-                norm_rewards = normalize_rewards(group_rewards)
+                    norm_rewards = [0.0 for _ in group_rewards]
+                else:
+                    informative_groups += 1
+                    norm_rewards = normalize_rewards(group_rewards)
 
                 # Stash for optional KL computation (including vision tensors).
                 vision_kwargs: Dict[str, torch.Tensor] = {
@@ -509,35 +508,33 @@ class GRPOTrainer:
                 # Steps 5–6: Teacher-forcing log-probs (train mode)
                 # ----------------------------------------------------------
                 self.model.train()
+                from contextlib import nullcontext
+                
+                # To prevent OOM, compute gradients per sequence and free graph
+                # Use no_sync to accumulate local gradients until the VERY last generated sequence in the micro-step!
+                # Wait, this is done per-record. To do it per-microstep, we need
+                # all elements. Let's just accumulate log_probs but detach them? No, we need gradients.
+                
                 for gen_ids, advantage in zip(
                     group_generated_ids, norm_rewards
                 ):
                     gen_len = gen_ids.shape[1]
                     full_ids = torch.cat(
                         [prompt_inputs["input_ids"], gen_ids], dim=1
-                    )  # (1, prompt_len + gen_len)
-
-                    # Preserve prompt padding mask; generated tokens always attend.
+                    )
                     full_mask = torch.cat([
                         prompt_inputs["attention_mask"],
                         torch.ones((1, gen_len), dtype=prompt_inputs["attention_mask"].dtype, device=self.device),
                     ], dim=1)
 
-                    # Mask prompt positions in labels so they do not contribute
-                    # to the log-prob computation.
                     labels = full_ids.clone()
                     labels[:, :prompt_len] = -100
 
-                    # Pass pixel_values and image_grid_thw through if present.
                     extra_kwargs: Dict[str, torch.Tensor] = {}
                     for k in ("pixel_values", "image_grid_thw"):
                         if k in prompt_inputs:
                             extra_kwargs[k] = prompt_inputs[k]
 
-                    # Standard GRPO: use the current policy's log-prob directly.
-                    # L = -E[Â_i · log π_θ(y_i | x_i)]
-                    # _compute_seq_log_probs returns mean per-token log-prob,
-                    # so the signal is already length-normalised.
                     log_prob = self._compute_seq_log_probs(
                         full_ids, full_mask, labels, extra_kwargs
                     )
@@ -556,71 +553,36 @@ class GRPOTrainer:
             )
 
             # ----------------------------------------------------------
-            # DDP safety: EVERY rank must call backward() on EVERY
-            # micro-step, because DDP's gradient allreduce fires inside
-            # backward() and deadlocks if any rank skips it.  When all
-            # groups on a rank are flat (advantages = 0), we synthesize a
-            # differentiable-zero loss that touches every trainable
-            # parameter — contributing zero gradient while keeping DDP's
-            # NCCL sequence numbers in sync across all 8 ranks.
-            #
-            # IMPORTANT: earlier versions used a user-initiated
-            # accelerator.reduce() "has-signal" collective here to let
-            # all ranks coordinate whether to skip backward.  That
-            # CAUSED the NCCL timeout (SeqNum=98) because the extra
-            # collective interleaved with DDP's internal gradient
-            # allreduce, drifting sequence numbers.  The fix is to always
-            # backward — no user collectives needed.
+            # Step 6 (cont.): GRPO loss
+            # Since we now execute forwards for all groups (including flat ones),
+            # `all_log_probs` is never empty. Every rank performs EXACTLY the same
+            # number of DDP forward passes, completely avoiding NCCL sequence drift.
+            # Flat groups contribute exactly 0.0 to the loss via zero advantages.
             # ----------------------------------------------------------
-            # Ensure train mode before backward: the generation phase
-            # leaves the model in eval mode; if all groups were flat,
-            # self.model.train() was never called back.  DDP backward
-            # hooks must see consistent mode across ranks.
-            self.model.train()
-
-            if all_log_probs:
-                lp_tensor = torch.stack(all_log_probs)        # (N,)
-                adv_tensor = torch.tensor(
-                    all_advantages,
-                    dtype=torch.float32,
-                    device=self.device,
+            
+            if flat_groups > 0 and (micro_step <= 2 or micro_step % (log_steps * grad_accum) == 0):
+                logger.warning(
+                    "%d/%d groups on rank %d were flat (micro_step=%d) - contributing 0.0 gradient.",
+                    flat_groups, flat_groups + informative_groups, self.rank, micro_step,
                 )
-                loss = grpo_loss(lp_tensor, adv_tensor)
 
-                # Optional KL penalty, gated by kl_coeff > 0.
-                if self.kl_coeff > 0.0 and self.ref_model is not None:
-                    kl_total = self._compute_batch_kl(kl_data)
-                    loss = loss + self.kl_coeff * kl_total
+            lp_tensor = torch.stack(all_log_probs)        # (N,)
+            adv_tensor = torch.tensor(
+                all_advantages,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            loss = grpo_loss(lp_tensor, adv_tensor)
 
-                scaled_loss = loss / grad_accum
-                self.accelerator.backward(scaled_loss)
-                running_loss += loss.item()
-            else:
-                # All groups on this rank were flat.  We still need to
-                # call backward so DDP's gradient allreduce fires and
-                # ranks stay in sync.  The zero-gradient contribution
-                # from this rank correctly dilutes the global gradient
-                # average — flat ranks genuinely had nothing to contribute.
-                trainable = [
-                    p for p in self.model.parameters() if p.requires_grad
-                ]
-                if trainable:
-                    dummy = torch.stack([p.sum() for p in trainable]).sum() * 0.0
-                else:  # pragma: no cover — LoRA always has trainable params
-                    dummy = torch.zeros((), device=self.device, requires_grad=True)
-                self.accelerator.backward(dummy / grad_accum)
+            # Optional KL penalty, gated by kl_coeff > 0.
+            if self.kl_coeff > 0.0 and self.ref_model is not None:
+                kl_total = self._compute_batch_kl(kl_data)
+                loss = loss + self.kl_coeff * kl_total
 
-                if flat_groups > 0 and (micro_step <= 2 or micro_step % (log_steps * grad_accum) == 0):
-                    logger.warning(
-                        "All %d groups on rank %d were flat (micro_step=%d); "
-                        "backward with zero gradient.",
-                        flat_groups, self.rank, micro_step,
-                    )
-
+            scaled_loss = loss / grad_accum
+            self.accelerator.backward(scaled_loss)
+            running_loss += loss.item()
             micro_step += 1
-
-            # ----------------------------------------------------------
-            # Optimizer step — fires every grad_accum micro-steps.
             # Always steps the optimizer (even if all gradients were
             # zero from flat groups) so DDP stays in a clean state and
             # the scheduler/curriculum advance deterministically.

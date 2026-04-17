@@ -1,6 +1,6 @@
-raw_dir: data/raw
-processed_dir: data/processed
-scored_dir: data/scored
+raw_dir: /data/troy/datasets/guac/raw
+processed_dir: /data/troy/datasets/guac/processed
+scored_dir: /data/troy/datasets/guac/scored
 
 datasets:
   - name: geometry3k
@@ -13,8 +13,15 @@ datasets:
     splits: [train, validation, test]
     filter_no_image: true   # skip text-only rows
 
+  - name: mathverse
+    hf_id: AI4Math/MathVerse
+    splits: [testmini]
+    filter_no_image: false
+
 # Mapping from HF split name → output filename stem
 split_name_map:
   train: train
   validation: val
   test: test
+  testmini: test
+
