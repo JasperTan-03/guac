@@ -1,8 +1,8 @@
 """GRPO trainer wrapper using TRL's GRPOTrainer in vLLM Server Mode.
 
-Architecture: 2/6 GPU split.
-  - GPUs 0–1: vLLM generation server (TP=2; doubles KV-cache for 96 concurrent seqs).
-  - GPUs 2–7: This process — GRPOTrainer with DeepSpeed ZeRO-2 (LoRA r=8).
+Architecture: 2/5 GPU split.
+  - GPUs 0,2: vLLM generation server (TP=2; doubles KV-cache for 96 concurrent seqs).
+  - GPUs 3–7: This process — GRPOTrainer with DeepSpeed ZeRO-3 (LoRA r=8).
 
 Curriculum updates happen at the *epoch* level rather than per-step.  After
 each ``steps_per_epoch`` optimizer steps, ``R_avg`` is read from the trainer's
@@ -330,33 +330,83 @@ class GUACGRPOTrainer:
                 _prev_trainer[0] = None
                 del prev
 
-            # If a saved LoRA adapter exists from the previous epoch, load it
-            # so training continues from where it left off.  Otherwise start
-            # from the base HuggingFace model with a fresh LoRA init.
-            if prev_ckpt is not None:
-                import torch
-                from peft import PeftModel
-                from transformers import AutoModelForVision2Seq
+            # Always pass the base model name + peft_config to the trainer so
+            # it initialises a fresh LoRA adapter.  If a checkpoint exists from
+            # the previous epoch, we load its adapter weights directly from the
+            # safetensors file *after* the trainer is built, bypassing PEFT's
+            # set_peft_model_state_dict / _maybe_shard_state_dict_for_tp path
+            # which unconditionally imports EmbeddingParallel (missing in the
+            # installed transformers version) whenever distributed is active.
+            import torch
+            from transformers import AutoModelForVision2Seq
 
-                base = AutoModelForVision2Seq.from_pretrained(
-                    str(self.cfg.model.name),
-                    torch_dtype=torch.bfloat16,
-                    device_map=None,  # DeepSpeed handles placement
-                )
-                model_arg = PeftModel.from_pretrained(base, str(prev_ckpt))
-                peft_config_arg = None  # already a PeftModel; skip re-wrapping
-            else:
-                model_arg = str(self.cfg.model.name)
-                peft_config_arg = self.peft_config
+            # Load base model in bfloat16. With low_cpu_mem_usage=True, tensors
+            # are allocated directly in bf16 on CPU (no intermediate fp32 copy),
+            # keeping peak CPU RAM at ~16.6 GiB.  DeepSpeed ZeRO-3 will shard
+            # this across all training ranks during accelerator.prepare(), so no
+            # single GPU ever holds the full 16.6 GiB model copy.
+            base_model = AutoModelForVision2Seq.from_pretrained(
+                str(self.cfg.model.name),
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+                device_map=None,  # DeepSpeed/ZeRO-3 handles placement and sharding
+            )
 
             trainer = CustomGRPOTrainer(
-                model=model_arg,
+                model=base_model,
                 reward_funcs=[self._make_reward_fn()],
                 args=grpo_config,
                 train_dataset=train_dataset,
-                peft_config=peft_config_arg,
+                peft_config=self.peft_config,
                 callbacks=[StepCallback()],
             )
+
+            # Load previous epoch's LoRA weights directly, bypassing PEFT's
+            # broken TP sharding import path.
+            if prev_ckpt is not None:
+                import torch
+                from safetensors.torch import load_file as st_load_file
+
+                adapter_path = prev_ckpt / "adapter_model.safetensors"
+                if adapter_path.is_file():
+                    saved_sd = st_load_file(str(adapter_path))
+                else:
+                    # Fallback to pytorch bin if safetensors not present
+                    bin_path = prev_ckpt / "adapter_model.bin"
+                    saved_sd = torch.load(str(bin_path), weights_only=True)
+
+                # Remap keys: saved adapter keys use the format
+                # "base_model.model.…lora_A.weight" (no adapter name)
+                # but the live PeftModel state dict expects
+                # "base_model.model.…lora_A.default.weight".
+                # We insert "default" before ".weight" for all lora_ keys.
+                import re as _re
+                _lora_key_pattern = _re.compile(r"(\.lora_[AB])(\.weight)$")
+                remapped_sd = {}
+                for k, v in saved_sd.items():
+                    new_k = _lora_key_pattern.sub(r"\1.default\2", k)
+                    remapped_sd[new_k] = v
+
+                if all("lora_" not in k for k in remapped_sd):
+                    logger.warning(
+                        "Adapter checkpoint keys don't contain 'lora_' — "
+                        "weights may not have loaded correctly."
+                    )
+                else:
+                    # The model is not yet ZeRO-sharded at this point — sharding
+                    # happens inside trainer.train() → accelerator.prepare().
+                    # Plain load_state_dict works correctly on the unsharded PEFT model.
+                    missing, unexpected = trainer.model.load_state_dict(
+                        remapped_sd, strict=False
+                    )
+                    logger.info(
+                        "Loaded LoRA adapter from %s "
+                        "(missing=%d, unexpected=%d).",
+                        prev_ckpt,
+                        len(missing),
+                        len(unexpected),
+                    )
+
             _prev_trainer[0] = trainer
 
             # --------------------------------------------------------------

@@ -1,21 +1,30 @@
 # HuggingFace accelerate config for the GRPO *training* job.
 #
-# This targets 5 GPUs (GPUs 3–7 via CUDA_VISIBLE_DEVICES=3,4,5,6,7 set in
+# This targets 6 GPUs (GPUs 2–7 via CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 set in
 # the launch script).  Generation is handled by a separate vLLM server on
 # GPUs 0–1 (TP=2) — TP=2 doubles KV-cache capacity so all concurrent
 # completion requests can be served per micro-step.
 #
-# DeepSpeed ZeRO-2 shards optimizer states and gradients across the 5 training
-# GPUs.  ZeRO-3 is unnecessary because LoRA (r=8) keeps the trainable parameter
-# count tiny (~20M vs 7B total); ZeRO-2 is simpler and faster for this ratio.
+# Why ZeRO-3 (not ZeRO-2)?
+# With bf16 mixed precision, DeepSpeed ZeRO-2 keeps fp32 master weights for
+# ALL 8.3B parameters (33.2 GiB) alongside the bf16 model copy (16.6 GiB) on
+# EVERY training GPU.  Combined that is ~50 GiB, exceeding the 47.5 GiB A6000
+# limit.  ZeRO-3 shards model parameters, gradients, and optimizer states
+# across all 6 training GPUs, bringing per-GPU peak down to ~8–10 GiB and
+# leaving ample room for activations and the NCCL communicator buffers.
+#
+# Note: zero3_init_flag=true means the model is sharded immediately on load
+# (via the deepspeed.zero.Init() context manager) so it never occupies the
+# full 16.6 GiB on a single GPU — crucial when loading Qwen2-VL-7B in the
+# training loop's per-epoch model reload.
 #
 # Usage:
-#   CUDA_VISIBLE_DEVICES=3,4,5,6,7 accelerate launch \
+#   CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 accelerate launch \
 #       --config_file=accelerate_config_grpo.yaml \
 #       scripts/train_grpo.py [overrides...]
 compute_environment: LOCAL_MACHINE
 distributed_type: DEEPSPEED
-num_processes: 5
+num_processes: 6
 num_machines: 1
 mixed_precision: bf16
 use_cpu: false
@@ -25,7 +34,9 @@ downcast_bf16: 'no'
 deepspeed_config:
   gradient_accumulation_steps: 4    # Matches hf gradient_accumulation_steps=4
   gradient_clipping: 1.0
-  offload_optimizer_device: none    # Keep optimizer states on GPU (no CPU offload)
-  offload_param_device: none        # Keep params on GPU
-  zero3_init_flag: false
-  zero_stage: 2
+  offload_optimizer_device: none    # Keep optimizer states on GPU
+  offload_param_device: none        # Keep params on GPU (no CPU offload)
+  zero3_init_flag: true             # Shard params on load — avoids 16.6 GiB peak on rank 0
+  zero3_save_16bit_model: true      # Save bf16 weights (not fp32 shards) for portability
+  zero_stage: 3
+

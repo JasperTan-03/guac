@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Phase 3: GRPO Training — 2/5 GPU split with vLLM Server Mode.
+# Phase 3: GRPO Training — 2/6 GPU split with vLLM Server Mode.
 #
 # Architecture:
 #   GPUs 0–1 → vLLM generation server (TP=2; doubles KV-cache capacity vs TP=1)
-#   GPUs 3–7 → GRPOTrainer, DeepSpeed ZeRO-2, 5-way DDP
+#   GPUs 2–7 → GRPOTrainer, DeepSpeed ZeRO-3, 6-way DDP
 #
 # Why TP=2?  With TP=1, a single A6000 (48 GB) can serve ~48 concurrent
 # sequences.  But 5 training GPUs × batch_size=2 × num_generations=8 = 80
@@ -14,7 +14,7 @@
 # This script:
 #   1. Starts the vLLM server in the background on GPUs 0–1 (TP=2).
 #   2. Waits for the server health endpoint to respond (up to 120s).
-#   3. Launches the GRPOTrainer accelerate job on GPUs 3–7.
+#   3. Launches the GRPOTrainer accelerate job on GPUs 2–7.
 #   4. On exit (normal or Ctrl-C), kills the vLLM server process.
 #
 # Usage:
@@ -53,10 +53,10 @@ trap cleanup EXIT INT TERM
 # ---------------------------------------------------------------------------
 # Step 1: Start vLLM server on GPUs 0–1 (TP=2)
 # ---------------------------------------------------------------------------
-echo "=== Phase 3: GRPO Training (2/5 GPU split) ==="
+echo "=== Phase 3: GRPO Training (2/6 GPU split) ==="
 echo ""
 echo "--- Starting vLLM server on GPUs 0–1 (TP=2) ---"
-CUDA_VISIBLE_DEVICES=0,2 trl vllm-serve \
+CUDA_VISIBLE_DEVICES=0,1 trl vllm-serve \
     --model "${MODEL}" \
     --tensor-parallel-size 2 \
     --max-model-len "${MAX_MODEL_LEN}" \
@@ -90,8 +90,8 @@ echo "vLLM server is healthy at http://localhost:${VLLM_PORT}"
 # Step 3: Launch GRPOTrainer on GPUs 2–7
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- Launching GRPOTrainer on GPUs 3–7 (DeepSpeed ZeRO-2, 5-way DDP) ---"
-CUDA_VISIBLE_DEVICES=3,4,5,6,7 accelerate launch \
+echo "--- Launching GRPOTrainer on GPUs 2–7 (DeepSpeed ZeRO-3, 6-way DDP) ---"
+CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 accelerate launch \
     --config_file=accelerate_config_grpo.yaml \
     scripts/train_grpo.py \
     training=grpo_trl \
