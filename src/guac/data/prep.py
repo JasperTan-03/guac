@@ -65,8 +65,7 @@ def load_geometry3k(hf_id: str, split: str) -> List[Dict]:
 
         if not prompt or not answer:
             logger.debug(
-                f"geometry3k: skipping {row_id} — empty prompt or answer "
-                f"(prompt={bool(prompt)}, answer={bool(answer)})"
+                f"geometry3k: skipping {row_id} — empty prompt or answer (prompt={bool(prompt)}, answer={bool(answer)})"
             )
             skipped += 1
             continue
@@ -79,19 +78,13 @@ def load_geometry3k(hf_id: str, split: str) -> List[Dict]:
             if pil_img is not None:
                 image_b64 = encode_image(pil_img)
 
-        records.append(
-            {"id": row_id, "image": image_b64, "prompt": prompt, "answer": answer}
-        )
+        records.append({"id": row_id, "image": image_b64, "prompt": prompt, "answer": answer})
 
-    logger.info(
-        f"geometry3k split={split}: {len(records)} records kept, {skipped} skipped"
-    )
+    logger.info(f"geometry3k split={split}: {len(records)} records kept, {skipped} skipped")
     return records
 
 
-def load_scienceqa(
-    hf_id: str, split: str, filter_no_image: bool = True
-) -> List[Dict]:
+def load_scienceqa(hf_id: str, split: str, filter_no_image: bool = True) -> List[Dict]:
     """Load the ScienceQA dataset for the given split.
 
     Uses the ``derek-thomas/ScienceQA`` HuggingFace dataset. Each row
@@ -118,9 +111,7 @@ def load_scienceqa(
     """
     import datasets as hf_datasets
 
-    logger.info(
-        f"Loading {hf_id} split={split} filter_no_image={filter_no_image}"
-    )
+    logger.info(f"Loading {hf_id} split={split} filter_no_image={filter_no_image}")
     ds = hf_datasets.load_dataset(hf_id, split=split)
 
     records: List[Dict] = []
@@ -160,19 +151,13 @@ def load_scienceqa(
             continue
 
         if not prompt or not answer:
-            logger.debug(
-                f"scienceqa: skipping {row_id} — empty prompt or answer"
-            )
+            logger.debug(f"scienceqa: skipping {row_id} — empty prompt or answer")
             skipped += 1
             continue
 
-        records.append(
-            {"id": row_id, "image": image_b64, "prompt": prompt, "answer": answer}
-        )
+        records.append({"id": row_id, "image": image_b64, "prompt": prompt, "answer": answer})
 
-    logger.info(
-        f"scienceqa split={split}: {len(records)} records kept, {skipped} skipped"
-    )
+    logger.info(f"scienceqa split={split}: {len(records)} records kept, {skipped} skipped")
     return records
 
 
@@ -220,19 +205,13 @@ def load_mathverse(hf_id: str, split: str) -> List[Dict]:
         answer = str(row.get("answer", "")).strip()
 
         if not prompt or not answer:
-            logger.debug(
-                f"mathverse: skipping {row_id} — empty prompt or answer"
-            )
+            logger.debug(f"mathverse: skipping {row_id} — empty prompt or answer")
             skipped += 1
             continue
 
-        records.append(
-            {"id": row_id, "image": image_b64, "prompt": prompt, "answer": answer}
-        )
+        records.append({"id": row_id, "image": image_b64, "prompt": prompt, "answer": answer})
 
-    logger.info(
-        f"mathverse split={split}: {len(records)} records kept, {skipped} skipped"
-    )
+    logger.info(f"mathverse split={split}: {len(records)} records kept, {skipped} skipped")
     return records
 
 
@@ -355,8 +334,7 @@ def prepare_all(cfg: DictConfig) -> None:
         loader = _LOADERS.get(ds_name)
         if loader is None:
             logger.error(
-                f"No loader registered for dataset '{ds_name}'. "
-                f"Registered loaders: {list(_LOADERS)}. Skipping."
+                f"No loader registered for dataset '{ds_name}'. Registered loaders: {list(_LOADERS)}. Skipping."
             )
             continue
 
@@ -366,9 +344,7 @@ def prepare_all(cfg: DictConfig) -> None:
 
             try:
                 if ds_name == "scienceqa":
-                    records = loader(
-                        hf_id, hf_split, filter_no_image=filter_no_image
-                    )
+                    records = loader(hf_id, hf_split, filter_no_image=filter_no_image)
                 else:
                     records = loader(hf_id, hf_split)
             except Exception as exc:
@@ -382,17 +358,13 @@ def prepare_all(cfg: DictConfig) -> None:
             try:
                 save_jsonl(records, str(out_path))
             except Exception as exc:
-                logger.error(
-                    f"Failed to save {out_path}: {exc}", exc_info=True
-                )
+                logger.error(f"Failed to save {out_path}: {exc}", exc_info=True)
                 summary_rows.append((ds_name, hf_split, "SAVE_ERROR", str(out_path)))
                 continue
 
             stem_files[split_stem].append(str(out_path))
             summary_rows.append((ds_name, hf_split, len(records), str(out_path)))
-            logger.info(
-                f"Saved {len(records):,} records -> {out_path}"
-            )
+            logger.info(f"Saved {len(records):,} records -> {out_path}")
 
     # --- Merge per-stem ---
     processed_dir.mkdir(parents=True, exist_ok=True)
@@ -410,9 +382,7 @@ def prepare_all(cfg: DictConfig) -> None:
         try:
             save_jsonl(merged, str(merged_path))
             merge_summary.append((stem, len(merged), str(merged_path)))
-            logger.info(
-                f"Merged {stem}: {len(merged):,} total records -> {merged_path}"
-            )
+            logger.info(f"Merged {stem}: {len(merged):,} total records -> {merged_path}")
         except Exception as exc:
             logger.error(f"Failed to save merged {merged_path}: {exc}", exc_info=True)
             merge_summary.append((stem, "SAVE_ERROR", str(merged_path)))
@@ -451,4 +421,3 @@ def _log_summary(
         count_str = f"{count:,}" if isinstance(count, int) else str(count)
         logger.info(f"{stem:<20} {count_str:>10}  {path}")
     logger.info(sep)
-

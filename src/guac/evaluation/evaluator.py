@@ -216,11 +216,7 @@ def format_mathvista_prompt(question: str, choices: Optional[List]) -> str:
     """
     if choices:
         choices_str = ", ".join(str(c) for c in choices)
-        return (
-            f"{question}\n"
-            f"Choices: {choices_str}\n"
-            "Answer with the correct option letter only."
-        )
+        return f"{question}\nChoices: {choices_str}\nAnswer with the correct option letter only."
     return f"{question}\nProvide only the final numerical answer."
 
 
@@ -235,11 +231,7 @@ def format_mmmu_prompt(question: str, options: List) -> str:
         A formatted prompt string ready to be included in the chat template.
     """
     options_str = ", ".join(str(o) for o in options)
-    return (
-        f"{question}\n"
-        f"Options: {options_str}\n"
-        "Answer with a single letter (A, B, C, or D) only."
-    )
+    return f"{question}\nOptions: {options_str}\nAnswer with a single letter (A, B, C, or D) only."
 
 
 # ---------------------------------------------------------------------------
@@ -382,17 +374,13 @@ def evaluate_mathvista(
     correct = 0
     skipped = 0
 
-    for batch_start in tqdm(
-        range(0, total, batch_size), desc="MathVista", unit="batch"
-    ):
+    for batch_start in tqdm(range(0, total, batch_size), desc="MathVista", unit="batch"):
         batch_raw = samples[batch_start : batch_start + batch_size]
         batch_items: List[Dict] = []
 
         for idx, sample in enumerate(batch_raw):
             # Prefer decoded_image (PIL), fall back to image (may be a path)
-            image = _extract_pil_image(
-                sample.get("decoded_image") or sample.get("image")
-            )
+            image = _extract_pil_image(sample.get("decoded_image") or sample.get("image"))
             if image is None:
                 logger.warning(
                     "MathVista sample %d: missing image, skipping.",
@@ -402,17 +390,13 @@ def evaluate_mathvista(
                 continue
 
             choices = sample.get("choices") or sample.get("options")
-            question_text = format_mathvista_prompt(
-                sample.get("question", ""), choices
-            )
+            question_text = format_mathvista_prompt(sample.get("question", ""), choices)
             content = [
                 {"type": "image", "image": image},
                 {"type": "text", "text": question_text},
             ]
             messages = [{"role": "user", "content": content}]
-            batch_items.append(
-                {"messages": messages, "raw": sample, "choices": choices}
-            )
+            batch_items.append({"messages": messages, "raw": sample, "choices": choices})
 
         if not batch_items:
             continue
@@ -420,9 +404,7 @@ def evaluate_mathvista(
         try:
             outputs = run_inference_batch(model, processor, batch_items)
         except Exception as exc:
-            logger.warning(
-                "Inference error on MathVista batch at %d: %s", batch_start, exc
-            )
+            logger.warning("Inference error on MathVista batch at %d: %s", batch_start, exc)
             skipped += len(batch_items)
             continue
 
@@ -431,9 +413,7 @@ def evaluate_mathvista(
             choices = item["choices"]
             ground_truth = str(raw.get("answer", "")).strip()
 
-            predicted = (
-                parse_mc_answer(output) if choices else parse_numeric_answer(output)
-            )
+            predicted = parse_mc_answer(output) if choices else parse_numeric_answer(output)
             if predicted is None:
                 skipped += 1
                 continue
@@ -508,9 +488,7 @@ def evaluate_mmmu(
     correct = 0
     skipped = 0
 
-    for batch_start in tqdm(
-        range(0, total, batch_size), desc="MMMU", unit="batch"
-    ):
+    for batch_start in tqdm(range(0, total, batch_size), desc="MMMU", unit="batch"):
         batch_raw = samples[batch_start : batch_start + batch_size]
         batch_items: List[Dict] = []
 
@@ -549,9 +527,7 @@ def evaluate_mmmu(
         try:
             outputs = run_inference_batch(model, processor, batch_items)
         except Exception as exc:
-            logger.warning(
-                "Inference error on MMMU batch at %d: %s", batch_start, exc
-            )
+            logger.warning("Inference error on MMMU batch at %d: %s", batch_start, exc)
             skipped += len(batch_items)
             continue
 
@@ -647,9 +623,7 @@ def run_evaluation(cfg: DictConfig, checkpoint_path: str) -> Dict:
         try:
             benchmarks["MathVista"] = evaluate_mathvista(model, processor, cfg)
         except Exception as exc:
-            logger.error(
-                "MathVista evaluation crashed: %s", exc, exc_info=True
-            )
+            logger.error("MathVista evaluation crashed: %s", exc, exc_info=True)
             benchmarks["MathVista"] = {
                 "accuracy": 0.0,
                 "correct": 0,
@@ -669,11 +643,7 @@ def run_evaluation(cfg: DictConfig, checkpoint_path: str) -> Dict:
                 "skipped": 0,
             }
 
-        macro_average = (
-            sum(b["accuracy"] for b in benchmarks.values()) / len(benchmarks)
-            if benchmarks
-            else 0.0
-        )
+        macro_average = sum(b["accuracy"] for b in benchmarks.values()) / len(benchmarks) if benchmarks else 0.0
 
         # Log metrics to MLflow
         mlflow.log_metrics(
@@ -724,6 +694,5 @@ if __name__ == "__main__":
     # This module is intended to be called from scripts/evaluate.py.
     # Running it directly is not supported; use the entrypoint script instead.
     raise SystemExit(
-        "Run via scripts/evaluate.py, not directly. "
-        "Example: python scripts/evaluate.py checkpoint_path=<path>"
+        "Run via scripts/evaluate.py, not directly. Example: python scripts/evaluate.py checkpoint_path=<path>"
     )

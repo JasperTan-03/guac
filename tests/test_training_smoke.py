@@ -84,6 +84,7 @@ def _tiny_model_available() -> bool:
 def _torchvision_available() -> bool:
     try:
         import torchvision  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -102,6 +103,7 @@ _requires_tiny_model = pytest.mark.skipif(
 # --------------------------------------------------------------------------- #
 # Unit tests: reward-normalisation / flat-group detection
 # --------------------------------------------------------------------------- #
+
 
 def test_is_informative_group_flat_all_zero():
     assert not is_informative_group([0.0, 0.0, 0.0, 0.0])
@@ -193,20 +195,20 @@ def test_grpo_loss_is_nonzero_when_logprobs_and_advantages_vary():
     # A 1-D "parameter" that requires grad; log-probs flow through it.
     w = torch.tensor([1.0], requires_grad=True)
     # Per-rollout log-probs with clearly different values.
-    log_probs = torch.stack([
-        w * -5.0,
-        w * -3.0,
-        w * -7.0,
-        w * -4.0,
-    ]).squeeze(-1)
+    log_probs = torch.stack(
+        [
+            w * -5.0,
+            w * -3.0,
+            w * -7.0,
+            w * -4.0,
+        ]
+    ).squeeze(-1)
     # Advantages normalised from rewards [0, 1, 0, 1] (zero-mean).
     advantages = torch.tensor([-1.0, 1.0, -1.0, 1.0])
     loss = grpo_loss(log_probs, advantages)
     assert loss.abs().item() > 1e-6, f"loss too small: {loss!r}"
     loss.backward()
-    assert w.grad is not None and w.grad.abs().item() > 1e-6, (
-        f"No gradient reached w; grad={w.grad!r}"
-    )
+    assert w.grad is not None and w.grad.abs().item() > 1e-6, f"No gradient reached w; grad={w.grad!r}"
 
 
 # --------------------------------------------------------------------------- #
@@ -235,9 +237,9 @@ def test_curriculum_sampler_gaussian_ranks_draw_independently():
     diffs = _fake_difficulties(200)
     world = 8
     batches = [
-        CurriculumSampler(
-            diffs, mode="gaussian", sigma=0.15, seed=42, rank=r, world_size=world
-        ).sample(batch_size=4, T=0.5)
+        CurriculumSampler(diffs, mode="gaussian", sigma=0.15, seed=42, rank=r, world_size=world).sample(
+            batch_size=4, T=0.5
+        )
         for r in range(world)
     ]
     # Convert to frozensets for a quick pairwise-identity check: if any two
@@ -259,14 +261,11 @@ def test_curriculum_sampler_baseline_ranks_are_disjoint():
     world = 8
     all_indices = []
     for r in range(world):
-        sampler = CurriculumSampler(
-            diffs, mode="baseline", sigma=0.15, seed=42, rank=r, world_size=world
-        )
+        sampler = CurriculumSampler(diffs, mode="baseline", sigma=0.15, seed=42, rank=r, world_size=world)
         all_indices.extend(sampler.sample(batch_size=4, T=0.5))
     assert len(all_indices) == 4 * world
     assert len(set(all_indices)) == 4 * world, (
-        f"Baseline ranks overlap: got {len(set(all_indices))} unique of "
-        f"{len(all_indices)} total — {all_indices!r}"
+        f"Baseline ranks overlap: got {len(set(all_indices))} unique of {len(all_indices)} total — {all_indices!r}"
     )
 
 
@@ -274,9 +273,7 @@ def test_curriculum_sampler_baseline_rank_slices_are_stable():
     """Repeated calls from the same (rank, world_size) must return the same
     batch — the curriculum update rule relies on T-driven determinism."""
     diffs = _fake_difficulties(64)
-    s = CurriculumSampler(
-        diffs, mode="baseline", sigma=0.15, seed=42, rank=3, world_size=8
-    )
+    s = CurriculumSampler(diffs, mode="baseline", sigma=0.15, seed=42, rank=3, world_size=8)
     b1 = s.sample(batch_size=2, T=0.5)
     b2 = s.sample(batch_size=2, T=0.5)
     assert b1 == b2
@@ -285,16 +282,15 @@ def test_curriculum_sampler_baseline_rank_slices_are_stable():
 def test_curriculum_sampler_rejects_batch_exceeding_shard():
     """batch_size * world_size must be <= dataset size."""
     diffs = _fake_difficulties(16)
-    s = CurriculumSampler(
-        diffs, mode="gaussian", sigma=0.15, seed=42, rank=0, world_size=8
-    )
+    s = CurriculumSampler(diffs, mode="gaussian", sigma=0.15, seed=42, rank=0, world_size=8)
     with pytest.raises(ValueError, match="exceeds dataset size"):
-        s.sample(batch_size=4, T=0.5)   # 4 * 8 = 32 > 16
+        s.sample(batch_size=4, T=0.5)  # 4 * 8 = 32 > 16
 
 
 # --------------------------------------------------------------------------- #
 # Integration test: flat-vs-varied groups in the trainer
 # --------------------------------------------------------------------------- #
+
 
 def _build_smoke_cfg(output_dir: Path, mlflow_dir: Path) -> OmegaConf:
     """Build a minimal Hydra-compatible config for the smoke trainer.
@@ -327,7 +323,7 @@ def _build_smoke_cfg(output_dir: Path, mlflow_dir: Path) -> OmegaConf:
                 "max_grad_norm": 1.0,
                 "num_train_steps": 2,
                 "warmup_steps": 0,
-                "save_steps": 9999,   # don't checkpoint during the smoke test
+                "save_steps": 9999,  # don't checkpoint during the smoke test
                 "log_steps": 1,
                 "max_new_tokens": 4,
                 "temperature": 1.0,
@@ -379,9 +375,7 @@ def _patched_compute_reward(reward_fn):
 
 
 @_requires_tiny_model
-def test_trainer_skips_flat_groups_and_produces_nonzero_loss_on_varied(
-    tmp_path: Path, caplog
-):
+def test_trainer_skips_flat_groups_and_produces_nonzero_loss_on_varied(tmp_path: Path, caplog):
     """End-to-end: trainer runs two micro-steps with a monkeypatched reward.
 
     Micro-step 0 has *varied* rewards → loss must be non-zero, gradients
@@ -407,7 +401,6 @@ def test_trainer_skips_flat_groups_and_produces_nonzero_loss_on_varied(
 
     cfg = _build_smoke_cfg(
         output_dir=tmp_path / "ckpt",
-
     )
 
     # Pattern:
@@ -429,10 +422,7 @@ def test_trainer_skips_flat_groups_and_produces_nonzero_loss_on_varied(
         # .backward() provably reaches trainable params.  We vary the
         # per-call multiplier so the 4 rollouts in a group produce
         # genuinely different log_probs (scale -3, -5, -7, -4, ...).
-        lora_param = next(
-            p for n, p in trainer.model.named_parameters()
-            if p.requires_grad and "lora_A" in n
-        )
+        lora_param = next(p for n, p in trainer.model.named_parameters() if p.requires_grad and "lora_A" in n)
         coefficients = [-3.0, -5.0, -7.0, -4.0]
         call_idx = {"n": 0}
 
@@ -452,7 +442,7 @@ def test_trainer_skips_flat_groups_and_produces_nonzero_loss_on_varied(
             for p in trainer.model.parameters():
                 if p.requires_grad and p.grad is not None:
                     g_sq += float(p.grad.detach().abs().pow(2).sum().item())
-            captured_grad_norms.append(g_sq ** 0.5)
+            captured_grad_norms.append(g_sq**0.5)
             return real_step(*a, **kw)
 
         trainer.optimizer.step = step_with_probe  # type: ignore[assignment]
@@ -474,20 +464,15 @@ def test_trainer_skips_flat_groups_and_produces_nonzero_loss_on_varied(
     all_log_text = "\n".join(rec.getMessage() for rec in caplog.records)
     assert "flat" in all_log_text.lower(), (
         "Expected the trainer to log a 'flat' warning when all groups in "
-        "a micro-step had identical rewards; did not find one in:\n"
-        + all_log_text[-2000:]
+        "a micro-step had identical rewards; did not find one in:\n" + all_log_text[-2000:]
     )
 
     # Curriculum should still be a valid probability.
-    assert 0.0 <= trainer.curriculum.T <= 1.0, (
-        f"Curriculum T escaped [0, 1]: {trainer.curriculum.T}"
-    )
+    assert 0.0 <= trainer.curriculum.T <= 1.0, f"Curriculum T escaped [0, 1]: {trainer.curriculum.T}"
 
 
 @_requires_tiny_model
-def test_trainer_all_flat_batch_terminates_and_logs_warning(
-    tmp_path: Path, caplog
-):
+def test_trainer_all_flat_batch_terminates_and_logs_warning(tmp_path: Path, caplog):
     """When every group in every micro-step is flat, training must
     *terminate cleanly* at num_train_steps.  Under DDP, backward() is
     always called (with a differentiable-zero dummy loss on flat ranks)
@@ -505,7 +490,6 @@ def test_trainer_all_flat_batch_terminates_and_logs_warning(
 
     cfg = _build_smoke_cfg(
         output_dir=tmp_path / "ckpt",
-
     )
     cfg.training.num_train_steps = 2
     cfg.training.gradient_accumulation_steps = 1
@@ -515,10 +499,7 @@ def test_trainer_all_flat_batch_terminates_and_logs_warning(
         trainer = GRPOTrainer(cfg)
 
         # Snapshot a trainable param before training.
-        lora_param = next(
-            p for _, p in trainer.model.named_parameters()
-            if p.requires_grad and "lora" in _.lower()
-        )
+        lora_param = next(p for _, p in trainer.model.named_parameters() if p.requires_grad and "lora" in _.lower())
         before = lora_param.detach().clone()
 
         caplog.set_level(logging.WARNING, logger="guac.training.trainer")
@@ -534,12 +515,8 @@ def test_trainer_all_flat_batch_terminates_and_logs_warning(
         f"expected near-zero movement from dummy-loss backward."
     )
 
-    warn_text = "\n".join(
-        rec.getMessage() for rec in caplog.records if rec.levelno >= 30
-    )
-    assert "flat" in warn_text.lower(), (
-        "Expected a flat-group warning; got:\n" + warn_text
-    )
+    warn_text = "\n".join(rec.getMessage() for rec in caplog.records if rec.levelno >= 30)
+    assert "flat" in warn_text.lower(), "Expected a flat-group warning; got:\n" + warn_text
 
 
 # --------------------------------------------------------------------------- #
@@ -601,9 +578,7 @@ def _patched_compute_reward_reinforce(reward_fn):
 
 
 @_requires_tiny_model
-def test_reinforce_trainer_produces_nonzero_loss(
-    tmp_path: Path, caplog
-):
+def test_reinforce_trainer_produces_nonzero_loss(tmp_path: Path, caplog):
     """REINFORCE trainer must produce non-zero loss with varied rewards.
 
     With rewards [1.0, 0.0] on consecutive steps, the EMA baseline provides
@@ -615,7 +590,6 @@ def test_reinforce_trainer_produces_nonzero_loss(
 
     cfg = _build_reinforce_smoke_cfg(
         output_dir=tmp_path / "ckpt",
-
     )
 
     # Alternating rewards: step 1 gets reward 1.0, step 2 gets 0.0
@@ -625,10 +599,7 @@ def test_reinforce_trainer_produces_nonzero_loss(
     with _patched_compute_reward_reinforce(reward_fn):
         trainer = ReinforceTrainer(cfg)
 
-        lora_param = next(
-            p for n, p in trainer.model.named_parameters()
-            if p.requires_grad and "lora_A" in n
-        )
+        lora_param = next(p for n, p in trainer.model.named_parameters() if p.requires_grad and "lora_A" in n)
         coefficients = [-3.0, -5.0]
         call_idx = {"n": 0}
 
@@ -650,7 +621,7 @@ def test_reinforce_trainer_produces_nonzero_loss(
             for p in trainer.model.parameters():
                 if p.requires_grad and p.grad is not None:
                     g_sq += float(p.grad.detach().abs().pow(2).sum().item())
-            captured_grad_norms.append(g_sq ** 0.5)
+            captured_grad_norms.append(g_sq**0.5)
             return real_step(*a, **kw)
 
         trainer.optimizer.step = step_with_probe  # type: ignore[assignment]
@@ -659,8 +630,7 @@ def test_reinforce_trainer_produces_nonzero_loss(
         trainer.train()
 
     assert any(g > 0 for g in captured_grad_norms), (
-        f"Expected at least one optimizer step with non-zero gradient norm "
-        f"on LoRA params; got {captured_grad_norms!r}."
+        f"Expected at least one optimizer step with non-zero gradient norm on LoRA params; got {captured_grad_norms!r}."
     )
 
 
@@ -671,7 +641,6 @@ def test_reinforce_ema_baseline_updates(tmp_path: Path):
 
     cfg = _build_reinforce_smoke_cfg(
         output_dir=tmp_path / "ckpt",
-
     )
 
     reward_fn = _DeterministicReward([1.0, 1.0])
@@ -679,10 +648,7 @@ def test_reinforce_ema_baseline_updates(tmp_path: Path):
     with _patched_compute_reward_reinforce(reward_fn):
         trainer = ReinforceTrainer(cfg)
         # Patch log-prob computation to avoid real model forward
-        lora_param = next(
-            p for n, p in trainer.model.named_parameters()
-            if p.requires_grad and "lora_A" in n
-        )
+        lora_param = next(p for n, p in trainer.model.named_parameters() if p.requires_grad and "lora_A" in n)
         trainer._compute_seq_log_probs = (  # type: ignore[assignment]
             lambda pi, gi: lora_param.sum() * -3.0
         )
@@ -694,8 +660,7 @@ def test_reinforce_ema_baseline_updates(tmp_path: Path):
         trainer.train()
 
     assert trainer.ema_baseline > 0.0, (
-        f"EMA baseline should be >0 after training with reward=1.0; "
-        f"got {trainer.ema_baseline}"
+        f"EMA baseline should be >0 after training with reward=1.0; got {trainer.ema_baseline}"
     )
 
 
@@ -714,7 +679,6 @@ def test_reinforce_all_same_reward_still_has_gradient(tmp_path: Path):
 
     cfg = _build_reinforce_smoke_cfg(
         output_dir=tmp_path / "ckpt",
-
     )
 
     # ALL rewards are 1.0 — the exact scenario that makes GRPO produce zero loss.
@@ -724,10 +688,7 @@ def test_reinforce_all_same_reward_still_has_gradient(tmp_path: Path):
     with _patched_compute_reward_reinforce(reward_fn):
         trainer = ReinforceTrainer(cfg)
 
-        lora_param = next(
-            p for n, p in trainer.model.named_parameters()
-            if p.requires_grad and "lora_A" in n
-        )
+        lora_param = next(p for n, p in trainer.model.named_parameters() if p.requires_grad and "lora_A" in n)
         trainer._compute_seq_log_probs = (  # type: ignore[assignment]
             lambda pi, gi: lora_param.sum() * -3.0
         )
@@ -742,7 +703,7 @@ def test_reinforce_all_same_reward_still_has_gradient(tmp_path: Path):
             for p in trainer.model.parameters():
                 if p.requires_grad and p.grad is not None:
                     g_sq += float(p.grad.detach().abs().pow(2).sum().item())
-            captured_grad_norms.append(g_sq ** 0.5)
+            captured_grad_norms.append(g_sq**0.5)
             return real_step(*a, **kw)
 
         trainer.optimizer.step = step_with_probe  # type: ignore[assignment]
@@ -755,4 +716,3 @@ def test_reinforce_all_same_reward_still_has_gradient(tmp_path: Path):
         f"the GRPO flat-group bug has regressed! "
         f"Grad norms: {captured_grad_norms!r}"
     )
-

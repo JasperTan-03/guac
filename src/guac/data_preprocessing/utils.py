@@ -118,9 +118,7 @@ def safe_load_image(image_field) -> Optional[PIL.Image.Image]:
             if path:
                 return PIL.Image.open(path).convert("RGB")
 
-        logger.warning(
-            f"safe_load_image: unrecognised image_field type {type(image_field)}"
-        )
+        logger.warning(f"safe_load_image: unrecognised image_field type {type(image_field)}")
         return None
 
     except Exception as e:

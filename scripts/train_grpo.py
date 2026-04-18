@@ -50,8 +50,7 @@ def main(cfg: DictConfig) -> None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)
 
     log.info(
-        "Starting GRPO training | model=%s | epochs=%d | steps_per_epoch=%d "
-        "| sampling_mode=%s | vllm=%s:%d",
+        "Starting GRPO training | model=%s | epochs=%d | steps_per_epoch=%d | sampling_mode=%s | vllm=%s:%d",
         cfg.model.name,
         cfg.training.num_epochs,
         cfg.training.steps_per_epoch,

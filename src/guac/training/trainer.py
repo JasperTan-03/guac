@@ -141,7 +141,9 @@ class GRPOTrainer:
         if self.world_size > 1:
             logger.info(
                 "Distributed training detected: rank=%d/%d device=%s",
-                self.rank, self.world_size, self.device,
+                self.rank,
+                self.world_size,
+                self.device,
             )
 
         # ------------------------------------------------------------------
@@ -157,9 +159,7 @@ class GRPOTrainer:
         logger.info("Loading training data from %s ...", train_path)
         all_records = load_jsonl(str(train_path))
 
-        self.records: List[Dict[str, Any]] = [
-            r for r in all_records if r.get("difficulty") is not None
-        ]
+        self.records: List[Dict[str, Any]] = [r for r in all_records if r.get("difficulty") is not None]
         n_dropped = len(all_records) - len(self.records)
         if not self.records:
             raise ValueError(
@@ -227,8 +227,7 @@ class GRPOTrainer:
         # float32 off-CUDA so the smoke test (and any CPU fallback) works.
         if model_dtype == torch.bfloat16 and self.device.type != "cuda":
             logger.warning(
-                "Device %s does not reliably support bfloat16; coercing model "
-                "dtype to float32 for this run.",
+                "Device %s does not reliably support bfloat16; coercing model dtype to float32 for this run.",
                 self.device.type,
             )
             model_dtype = torch.float32
@@ -236,7 +235,8 @@ class GRPOTrainer:
         # Autocast is only useful on CUDA with bf16/fp16; elsewhere it's a
         # no-op contextmanager.
         self._autocast_enabled = self.device.type == "cuda" and model_dtype in (
-            torch.bfloat16, torch.float16,
+            torch.bfloat16,
+            torch.float16,
         )
         self._autocast_dtype = model_dtype if self._autocast_enabled else torch.float32
 
@@ -274,8 +274,7 @@ class GRPOTrainer:
         self.kl_coeff = float(tcfg.kl_coeff)
         if self.kl_coeff > 0.0:
             logger.info(
-                "Loading frozen reference model for KL penalty "
-                "(kl_coeff=%.4f) ...",
+                "Loading frozen reference model for KL penalty (kl_coeff=%.4f) ...",
                 self.kl_coeff,
             )
             # Load a clean copy of the *base* (non-LoRA) model as the reference.
@@ -315,7 +314,9 @@ class GRPOTrainer:
         # backward, so wrapping it would just waste registering unused
         # reducers.
         self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
-            self.model, self.optimizer, self.scheduler,
+            self.model,
+            self.optimizer,
+            self.scheduler,
         )
 
         # ------------------------------------------------------------------
@@ -329,9 +330,7 @@ class GRPOTrainer:
             self._mlflow_run = mlflow.start_run()
             # Log the full resolved config as flat params.
             mlflow.log_params(OmegaConf.to_container(cfg, resolve=True))
-            logger.info(
-                "MLflow run started: %s", self._mlflow_run.info.run_id
-            )
+            logger.info("MLflow run started: %s", self._mlflow_run.info.run_id)
 
     # ------------------------------------------------------------------
     # Public API
@@ -373,8 +372,8 @@ class GRPOTrainer:
         temperature = float(tcfg.temperature)
         top_p = float(tcfg.top_p)
 
-        global_step = 0     # completed optimizer steps
-        micro_step = 0      # forward-backward passes (resets at each optimizer step)
+        global_step = 0  # completed optimizer steps
+        micro_step = 0  # forward-backward passes (resets at each optimizer step)
         running_loss = 0.0
         running_reward = 0.0
         running_informative_groups = 0
@@ -409,9 +408,7 @@ class GRPOTrainer:
             # vision_kwargs).  Only populated for *informative* groups — flat
             # groups contribute nothing to the loss and must not contribute to
             # the KL term either.
-            kl_data: List[
-                Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]
-            ] = []
+            kl_data: List[Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]] = []
             # Count informative vs flat groups in this micro-step so the
             # diagnostic can surface advantage collapse instead of silently
             # producing zero gradients.
@@ -463,9 +460,7 @@ class GRPOTrainer:
                         group_generated_ids.append(gen_ids)
 
                         # Step 3: Compute reward
-                        decoded = self.processor.tokenizer.decode(
-                            gen_ids[0], skip_special_tokens=True
-                        ).strip()
+                        decoded = self.processor.tokenizer.decode(gen_ids[0], skip_special_tokens=True).strip()
                         r = compute_reward(decoded, ground_truth)
                         group_rewards.append(r)
 
@@ -494,38 +489,38 @@ class GRPOTrainer:
 
                 # Stash for optional KL computation (including vision tensors).
                 vision_kwargs: Dict[str, torch.Tensor] = {
-                    k: prompt_inputs[k] for k in ("pixel_values", "image_grid_thw")
-                    if k in prompt_inputs
+                    k: prompt_inputs[k] for k in ("pixel_values", "image_grid_thw") if k in prompt_inputs
                 }
-                kl_data.append((
-                    prompt_inputs["input_ids"],
-                    prompt_inputs["attention_mask"],
-                    group_generated_ids,
-                    vision_kwargs,
-                ))
+                kl_data.append(
+                    (
+                        prompt_inputs["input_ids"],
+                        prompt_inputs["attention_mask"],
+                        group_generated_ids,
+                        vision_kwargs,
+                    )
+                )
 
                 # ----------------------------------------------------------
                 # Steps 5–6: Teacher-forcing log-probs (train mode)
                 # ----------------------------------------------------------
                 self.model.train()
                 from contextlib import nullcontext
-                
+
                 # To prevent OOM, compute gradients per sequence and free graph
                 # Use no_sync to accumulate local gradients until the VERY last generated sequence in the micro-step!
                 # Wait, this is done per-record. To do it per-microstep, we need
                 # all elements. Let's just accumulate log_probs but detach them? No, we need gradients.
-                
-                for gen_ids, advantage in zip(
-                    group_generated_ids, norm_rewards
-                ):
+
+                for gen_ids, advantage in zip(group_generated_ids, norm_rewards):
                     gen_len = gen_ids.shape[1]
-                    full_ids = torch.cat(
-                        [prompt_inputs["input_ids"], gen_ids], dim=1
+                    full_ids = torch.cat([prompt_inputs["input_ids"], gen_ids], dim=1)
+                    full_mask = torch.cat(
+                        [
+                            prompt_inputs["attention_mask"],
+                            torch.ones((1, gen_len), dtype=prompt_inputs["attention_mask"].dtype, device=self.device),
+                        ],
+                        dim=1,
                     )
-                    full_mask = torch.cat([
-                        prompt_inputs["attention_mask"],
-                        torch.ones((1, gen_len), dtype=prompt_inputs["attention_mask"].dtype, device=self.device),
-                    ], dim=1)
 
                     labels = full_ids.clone()
                     labels[:, :prompt_len] = -100
@@ -535,9 +530,7 @@ class GRPOTrainer:
                         if k in prompt_inputs:
                             extra_kwargs[k] = prompt_inputs[k]
 
-                    log_prob = self._compute_seq_log_probs(
-                        full_ids, full_mask, labels, extra_kwargs
-                    )
+                    log_prob = self._compute_seq_log_probs(full_ids, full_mask, labels, extra_kwargs)
                     all_log_probs.append(log_prob)
                     all_advantages.append(advantage)
 
@@ -547,10 +540,7 @@ class GRPOTrainer:
             # Always update observability counters (even on all-flat).
             running_informative_groups += informative_groups
             running_flat_groups += flat_groups
-            running_reward += (
-                sum(batch_raw_rewards) / len(batch_raw_rewards)
-                if batch_raw_rewards else 0.0
-            )
+            running_reward += sum(batch_raw_rewards) / len(batch_raw_rewards) if batch_raw_rewards else 0.0
 
             # ----------------------------------------------------------
             # Step 6 (cont.): GRPO loss
@@ -559,14 +549,17 @@ class GRPOTrainer:
             # number of DDP forward passes, completely avoiding NCCL sequence drift.
             # Flat groups contribute exactly 0.0 to the loss via zero advantages.
             # ----------------------------------------------------------
-            
+
             if flat_groups > 0 and (micro_step <= 2 or micro_step % (log_steps * grad_accum) == 0):
                 logger.warning(
                     "%d/%d groups on rank %d were flat (micro_step=%d) - contributing 0.0 gradient.",
-                    flat_groups, flat_groups + informative_groups, self.rank, micro_step,
+                    flat_groups,
+                    flat_groups + informative_groups,
+                    self.rank,
+                    micro_step,
                 )
 
-            lp_tensor = torch.stack(all_log_probs)        # (N,)
+            lp_tensor = torch.stack(all_log_probs)  # (N,)
             adv_tensor = torch.tensor(
                 all_advantages,
                 dtype=torch.float32,
@@ -589,7 +582,8 @@ class GRPOTrainer:
             # ----------------------------------------------------------
             if micro_step % grad_accum == 0:
                 self.accelerator.clip_grad_norm_(
-                    self.model.parameters(), max_grad_norm,
+                    self.model.parameters(),
+                    max_grad_norm,
                 )
                 self.optimizer.step()
                 self.optimizer.zero_grad()
@@ -632,19 +626,14 @@ class GRPOTrainer:
                 total_flat = running_flat_groups
                 total_info = running_informative_groups
                 total_groups = total_info + total_flat
-                flat_frac = (
-                    total_flat / total_groups if total_groups > 0 else 0.0
-                )
+                flat_frac = total_flat / total_groups if total_groups > 0 else 0.0
                 # Log at log_steps intervals AND always on step 1 so the
                 # first model output is visible immediately for debugging.
-                should_log = (
-                    global_step % log_steps == 0 or global_step == 1
-                )
+                should_log = global_step % log_steps == 0 or global_step == 1
                 if should_log and self.is_main:
                     current_lr = self.scheduler.get_last_lr()[0]
                     logger.info(
-                        "step=%d | loss=%.4f | reward=%.4f | T=%.4f | lr=%.2e "
-                        "| flat_groups=%d/%d",
+                        "step=%d | loss=%.4f | reward=%.4f | T=%.4f | lr=%.2e | flat_groups=%d/%d",
                         global_step,
                         avg_loss,
                         R_avg,
@@ -709,12 +698,11 @@ class GRPOTrainer:
             final_dir.mkdir(parents=True, exist_ok=True)
             # unwrap_model so the saved adapter is plain PEFT weights,
             # not a DDP-wrapped state_dict.
-            self.accelerator.unwrap_model(self.model).save_pretrained(
-                str(final_dir)
-            )
+            self.accelerator.unwrap_model(self.model).save_pretrained(str(final_dir))
             self.processor.save_pretrained(str(final_dir))
             logger.info(
-                "Training complete. Final checkpoint saved to %s", final_dir,
+                "Training complete. Final checkpoint saved to %s",
+                final_dir,
             )
             mlflow.log_artifact(str(final_dir))
             mlflow.end_run()
@@ -816,7 +804,8 @@ class GRPOTrainer:
         if input_ids.shape[1] > max_seq:
             logger.warning(
                 "Sequence length %d exceeds max_seq_length=%d; truncating.",
-                input_ids.shape[1], max_seq,
+                input_ids.shape[1],
+                max_seq,
             )
             input_ids = input_ids[:, :max_seq]
             attention_mask = attention_mask[:, :max_seq]
@@ -834,16 +823,16 @@ class GRPOTrainer:
                 **extra_kwargs,
             )
 
-        logits = outputs.logits.float()          # upcasted for stability
+        logits = outputs.logits.float()  # upcasted for stability
 
-        shift_logits = logits[:, :-1, :]         # (1, L-1, V)
-        shift_labels = labels[:, 1:]             # (1, L-1)
+        shift_logits = logits[:, :-1, :]  # (1, L-1, V)
+        shift_labels = labels[:, 1:]  # (1, L-1)
 
         log_probs = F.log_softmax(shift_logits, dim=-1)
         token_lp = log_probs.gather(
             dim=-1,
             index=shift_labels.clamp(min=0).unsqueeze(-1),
-        ).squeeze(-1)                            # (1, L-1)
+        ).squeeze(-1)  # (1, L-1)
 
         valid_mask = (shift_labels != -100).float()
         n_tokens = valid_mask.sum().clamp(min=1.0)
@@ -875,18 +864,25 @@ class GRPOTrainer:
                 full_ids = torch.cat([p_ids, gen_ids], dim=1)
                 gen_len = gen_ids.shape[1]
                 # Preserve the prompt's padding mask; generated tokens attend.
-                full_mask = torch.cat([
-                    p_mask,
-                    torch.ones((1, gen_len), dtype=p_mask.dtype, device=self.device),
-                ], dim=1)
+                full_mask = torch.cat(
+                    [
+                        p_mask,
+                        torch.ones((1, gen_len), dtype=p_mask.dtype, device=self.device),
+                    ],
+                    dim=1,
+                )
 
                 # Reference forward pass (frozen, no grad).
                 with torch.no_grad():
-                    ref_logits = self.ref_model(
-                        input_ids=full_ids,
-                        attention_mask=full_mask,
-                        **v_kwargs,
-                    ).logits[:, -gen_len:, :].float()
+                    ref_logits = (
+                        self.ref_model(
+                            input_ids=full_ids,
+                            attention_mask=full_mask,
+                            **v_kwargs,
+                        )
+                        .logits[:, -gen_len:, :]
+                        .float()
+                    )
 
                 # Policy forward pass (with grad for loss backprop).
                 with torch.amp.autocast(
@@ -894,11 +890,15 @@ class GRPOTrainer:
                     dtype=self._autocast_dtype,
                     enabled=self._autocast_enabled,
                 ):
-                    policy_logits = self.model(
-                        input_ids=full_ids,
-                        attention_mask=full_mask,
-                        **v_kwargs,
-                    ).logits[:, -gen_len:, :].float()
+                    policy_logits = (
+                        self.model(
+                            input_ids=full_ids,
+                            attention_mask=full_mask,
+                            **v_kwargs,
+                        )
+                        .logits[:, -gen_len:, :]
+                        .float()
+                    )
 
                 policy_lp = F.log_softmax(policy_logits, dim=-1)
                 ref_lp = F.log_softmax(ref_logits, dim=-1)
@@ -927,9 +927,7 @@ class GRPOTrainer:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         # unwrap_model so the adapter directory contains plain PEFT
         # weights, not a DDP-wrapped state_dict.  No-op single-process.
-        self.accelerator.unwrap_model(self.model).save_pretrained(
-            str(ckpt_dir)
-        )
+        self.accelerator.unwrap_model(self.model).save_pretrained(str(ckpt_dir))
         self.processor.save_pretrained(str(ckpt_dir))
         logger.info("Checkpoint saved to %s", ckpt_dir)
         return str(ckpt_dir)

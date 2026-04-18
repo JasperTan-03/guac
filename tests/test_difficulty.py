@@ -28,9 +28,11 @@ from guac.judge.difficulty import (  # noqa: E402, I001 — importorskip must ru
 # Test fixtures
 # --------------------------------------------------------------------------- #
 
+
 @dataclass
 class MockLogprob:
     """Stand-in for ``vllm.Logprob`` — only ``.logprob`` is read."""
+
     logprob: float
 
 
@@ -57,6 +59,7 @@ def _lp(p: float) -> MockLogprob:
 # --------------------------------------------------------------------------- #
 # compute_continuous_difficulty
 # --------------------------------------------------------------------------- #
+
 
 def test_expectation_basic():
     """{1,2,3} with p={0.1,0.5,0.4} -> E = 1*0.1 + 2*0.5 + 3*0.4 = 2.3."""
@@ -117,9 +120,7 @@ def test_score_max_5_limits_digit_range():
     z = 0.1 + 0.3 + 0.3
     assert probs["1"] == pytest.approx(0.1 / z, rel=1e-9)
     assert probs["5"] == pytest.approx(0.3 / z, rel=1e-9)
-    assert exp == pytest.approx(
-        1 * (0.1 / z) + 2 * (0.3 / z) + 5 * (0.3 / z), rel=1e-9
-    )
+    assert exp == pytest.approx(1 * (0.1 / z) + 2 * (0.3 / z) + 5 * (0.3 / z), rel=1e-9)
 
 
 def test_empty_or_none_logprobs_returns_none():
@@ -141,6 +142,7 @@ def test_non_digit_tokens_yield_none():
 # --------------------------------------------------------------------------- #
 # parse_difficulty_score
 # --------------------------------------------------------------------------- #
+
 
 @pytest.mark.parametrize(
     "response,expected",
@@ -181,6 +183,7 @@ def test_parse_difficulty_score_first_valid_wins():
 # --------------------------------------------------------------------------- #
 # shard_records (data-parallel judging helper)
 # --------------------------------------------------------------------------- #
+
 
 def test_shard_records_partitions_and_covers_all():
     """Every record ends up in exactly one shard; shards are roughly balanced."""

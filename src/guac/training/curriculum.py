@@ -47,13 +47,9 @@ class CurriculumState:
     def __post_init__(self) -> None:
         """Validate that bounds and initial T are consistent."""
         if self.d_min >= self.d_max:
-            raise ValueError(
-                f"d_min ({self.d_min}) must be strictly less than d_max ({self.d_max})."
-            )
+            raise ValueError(f"d_min ({self.d_min}) must be strictly less than d_max ({self.d_max}).")
         if not (self.d_min <= self.T <= self.d_max):
-            raise ValueError(
-                f"T ({self.T}) must lie in [d_min={self.d_min}, d_max={self.d_max}]."
-            )
+            raise ValueError(f"T ({self.T}) must lie in [d_min={self.d_min}, d_max={self.d_max}].")
         if self.eta <= 0:
             raise ValueError(f"eta must be positive, got {self.eta}.")
 
@@ -134,9 +130,7 @@ class CurriculumSampler:
         world_size: int = 1,
     ) -> None:
         if mode not in ("baseline", "gaussian"):
-            raise ValueError(
-                f"sampling_mode must be 'baseline' or 'gaussian', got {mode!r}."
-            )
+            raise ValueError(f"sampling_mode must be 'baseline' or 'gaussian', got {mode!r}.")
         if not difficulties:
             raise ValueError("difficulties list must not be empty.")
         if sigma <= 0:
@@ -144,9 +138,7 @@ class CurriculumSampler:
         if world_size < 1:
             raise ValueError(f"world_size must be >= 1, got {world_size}.")
         if not 0 <= rank < world_size:
-            raise ValueError(
-                f"rank ({rank}) must be in [0, world_size={world_size})."
-            )
+            raise ValueError(f"rank ({rank}) must be in [0, world_size={world_size}).")
 
         self.difficulties = difficulties
         self.mode = mode
@@ -160,9 +152,7 @@ class CurriculumSampler:
         # rank's multinomial draws are independent.  Modulo 2**63 keeps
         # us within torch.Generator's allowed seed range.
         self._torch_gen = torch.Generator()
-        self._torch_gen.manual_seed(
-            (seed + rank * self._RANK_SEED_STRIDE) % (2**63 - 1)
-        )
+        self._torch_gen.manual_seed((seed + rank * self._RANK_SEED_STRIDE) % (2**63 - 1))
         # Pre-compute a float32 tensor for fast vectorised operations.
         self._diff_tensor = torch.tensor(difficulties, dtype=torch.float32)
 
@@ -247,12 +237,12 @@ class CurriculumSampler:
         Returns:
             List of sampled integer indices, length ``batch_size``.
         """
-        diff = self._diff_tensor - T          # (N,)
+        diff = self._diff_tensor - T  # (N,)
         # Compute log-weights and subtract max for numerical stability.
-        log_w = -(diff ** 2) / (2.0 * self.sigma ** 2)
+        log_w = -(diff**2) / (2.0 * self.sigma**2)
         log_w = log_w - log_w.max()
-        weights = torch.exp(log_w)            # (N,)
-        probs = weights / weights.sum()       # normalised probability distribution
+        weights = torch.exp(log_w)  # (N,)
+        probs = weights / weights.sum()  # normalised probability distribution
 
         indices = torch.multinomial(
             probs,

@@ -123,9 +123,7 @@ _SYMPY_MAX_INPUT_LEN = 200
 # math token, SymPy will never succeed.  Skipping the parse when this is
 # false is ~1000x cheaper than sympify+simplify on a wrong-but-textual
 # rollout.
-_MATH_LIKELY_RE = re.compile(
-    r"[0-9]|[+\-*/^=(){}]|\\frac|\\sqrt|\\pi|\\cdot|\\times"
-)
+_MATH_LIKELY_RE = re.compile(r"[0-9]|[+\-*/^=(){}]|\\frac|\\sqrt|\\pi|\\cdot|\\times")
 
 
 def _looks_like_math(s: str) -> bool:
@@ -359,8 +357,8 @@ def compute_log_probs(
     logits = outputs.logits.float()  # (B, L, V)
 
     # Causal LM convention: position t predicts token t+1.
-    shift_logits = logits[:, :-1, :]    # (B, L-1, V)
-    shift_labels = labels[:, 1:]        # (B, L-1)
+    shift_logits = logits[:, :-1, :]  # (B, L-1, V)
+    shift_labels = labels[:, 1:]  # (B, L-1)
 
     log_probs = F.log_softmax(shift_logits, dim=-1)  # (B, L-1, V)
 
@@ -414,8 +412,8 @@ def compute_kl_penalty(
     # F.kl_div expects log-space input Q and probability-space target P:
     #   KL(P || Q) = sum P * (log P - log Q) = F.kl_div(log_Q, P, ...)
     kl = F.kl_div(
-        input=ref_log_probs,           # log Q
-        target=policy_probs,           # P
+        input=ref_log_probs,  # log Q
+        target=policy_probs,  # P
         reduction="batchmean",
         log_target=False,
     )
@@ -448,10 +446,7 @@ def grpo_loss(
         ValueError: If ``log_probs`` is empty.
     """
     if log_probs.shape != advantages.shape:
-        raise ValueError(
-            f"Shape mismatch: log_probs {tuple(log_probs.shape)} "
-            f"!= advantages {tuple(advantages.shape)}."
-        )
+        raise ValueError(f"Shape mismatch: log_probs {tuple(log_probs.shape)} != advantages {tuple(advantages.shape)}.")
     if log_probs.numel() == 0:
         raise ValueError("grpo_loss received empty tensors.")
 

@@ -62,8 +62,7 @@ def main(cfg: DictConfig) -> None:
 
     if not question:
         raise ValueError(
-            "question must be provided: python scripts/infer.py "
-            "checkpoint_path=... question='your question here'"
+            "question must be provided: python scripts/infer.py checkpoint_path=... question='your question here'"
         )
 
     # ------------------------------------------------------------------
@@ -131,9 +130,7 @@ def main(cfg: DictConfig) -> None:
         {"role": "user", "content": content},
     ]
 
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = processor(
         text=[text],
         images=[pil_image] if pil_image is not None else None,

@@ -13,6 +13,7 @@ import os
 import sys
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -21,22 +22,22 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SCORED_DIR   = "/data/troy/datasets/guac/scored"
+SCORED_DIR = "/data/troy/datasets/guac/scored"
 CHARTQA_CKPT = os.path.join(SCORED_DIR, "chartqa_train.jsonl.ckpt")
-HERE         = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_PDF   = os.path.join(HERE, "..", "difficulty_distribution.pdf")
-OUTPUT_PNG   = os.path.join(HERE, "..", "difficulty_distribution.png")
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_PDF = os.path.join(HERE, "..", "difficulty_distribution.pdf")
+OUTPUT_PNG = os.path.join(HERE, "..", "difficulty_distribution.png")
 
-N_BINS     = 10
-BIN_EDGES  = np.linspace(0.0, 1.0, N_BINS + 1)
+N_BINS = 10
+BIN_EDGES = np.linspace(0.0, 1.0, N_BINS + 1)
 BIN_CENTERS = 0.5 * (BIN_EDGES[:-1] + BIN_EDGES[1:])
-BIN_WIDTH  = BIN_EDGES[1] - BIN_EDGES[0]
+BIN_WIDTH = BIN_EDGES[1] - BIN_EDGES[0]
 
 DATASET_META = {
     "geometry3k": dict(label="Geometry3K", color="#4e79a7"),
-    "scienceqa":  dict(label="ScienceQA",  color="#f28e2b"),
-    "mathverse":  dict(label="MathVerse",  color="#e15759"),
-    "chartqa":    dict(label="ChartQA",    color="#76b7b2"),
+    "scienceqa": dict(label="ScienceQA", color="#f28e2b"),
+    "mathverse": dict(label="MathVerse", color="#e15759"),
+    "chartqa": dict(label="ChartQA", color="#76b7b2"),
 }
 DATASET_ORDER = ["geometry3k", "scienceqa", "mathverse", "chartqa"]
 
@@ -98,10 +99,11 @@ def draw_bars(ax, binned, log_scale=False):
     for ds in DATASET_ORDER:
         if ds not in binned:
             continue
-        meta   = DATASET_META[ds]
+        meta = DATASET_META[ds]
         counts = binned[ds].astype(float)
         ax.bar(
-            BIN_CENTERS, counts,
+            BIN_CENTERS,
+            counts,
             width=bar_width,
             bottom=bottom,
             color=meta["color"],
@@ -116,26 +118,30 @@ def draw_bars(ax, binned, log_scale=False):
 # Figure
 # ---------------------------------------------------------------------------
 def make_figure(binned):
-    plt.rcParams.update({
-        "font.family":       "serif",
-        "font.serif":        ["Times New Roman", "DejaVu Serif"],
-        "font.size":         9,
-        "axes.titlesize":    10,
-        "axes.labelsize":    9,
-        "xtick.labelsize":   8,
-        "ytick.labelsize":   8,
-        "legend.fontsize":   8.5,
-        "axes.linewidth":    0.7,
-        "xtick.major.width": 0.7,
-        "ytick.major.width": 0.7,
-        "figure.dpi":        150,
-        "savefig.dpi":       300,
-        "axes.spines.top":   False,
-        "axes.spines.right": False,
-    })
+    plt.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.serif": ["Times New Roman", "DejaVu Serif"],
+            "font.size": 9,
+            "axes.titlesize": 10,
+            "axes.labelsize": 9,
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 8,
+            "legend.fontsize": 8.5,
+            "axes.linewidth": 0.7,
+            "xtick.major.width": 0.7,
+            "ytick.major.width": 0.7,
+            "figure.dpi": 150,
+            "savefig.dpi": 300,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+        }
+    )
 
     fig, (ax_lin, ax_log) = plt.subplots(
-        1, 2, figsize=(7.2, 3.0),
+        1,
+        2,
+        figsize=(7.2, 3.0),
         gridspec_kw={"wspace": 0.38},
     )
 
@@ -152,9 +158,13 @@ def make_figure(binned):
     # label tallest bar only
     idx_max = int(np.argmax(total_lin))
     ax_lin.text(
-        BIN_CENTERS[idx_max], total_lin[idx_max] + total_lin.max() * 0.012,
+        BIN_CENTERS[idx_max],
+        total_lin[idx_max] + total_lin.max() * 0.012,
         f"{int(total_lin[idx_max]):,}",
-        ha="center", va="bottom", fontsize=7, color="#222222",
+        ha="center",
+        va="bottom",
+        fontsize=7,
+        color="#222222",
     )
 
     # ---- Panel B: log ----
@@ -171,27 +181,31 @@ def make_figure(binned):
     ax_log.set_ylim(bottom=0.8)
     for x, t in zip(BIN_CENTERS, total_log):
         if t > 0:
-            ax_log.text(x, t * 1.25, f"{int(t):,}",
-                        ha="center", va="bottom", fontsize=6, color="#222222")
+            ax_log.text(x, t * 1.25, f"{int(t):,}", ha="center", va="bottom", fontsize=6, color="#222222")
 
     # ---- Legend (on log panel) ----
     legend_patches = [
-        mpatches.Patch(facecolor=DATASET_META[ds]["color"],
-                       label=DATASET_META[ds]["label"])
+        mpatches.Patch(facecolor=DATASET_META[ds]["color"], label=DATASET_META[ds]["label"])
         for ds in reversed(DATASET_ORDER)
         if ds in binned
     ]
     ax_log.legend(
         handles=legend_patches,
         loc="upper right",
-        frameon=True, framealpha=0.92, edgecolor="#bbbbbb",
-        handlelength=1.1, handleheight=0.85,
-        borderpad=0.55, labelspacing=0.30,
+        frameon=True,
+        framealpha=0.92,
+        edgecolor="#bbbbbb",
+        handlelength=1.1,
+        handleheight=0.85,
+        borderpad=0.55,
+        labelspacing=0.30,
     )
 
     fig.suptitle(
         "Data Difficulty Distribution by Dataset",
-        fontsize=11, fontweight="bold", y=1.01,
+        fontsize=11,
+        fontweight="bold",
+        y=1.01,
     )
     fig.tight_layout(pad=0.5)
     return fig
@@ -205,8 +219,9 @@ def main():
     data = collect_difficulties()
     for ds, diffs in sorted(data.items()):
         arr = np.array(diffs)
-        print(f"  {ds:>12s}: {len(arr):6,d} examples  "
-              f"(mean={arr.mean():.3f}, min={arr.min():.2f}, max={arr.max():.2f})")
+        print(
+            f"  {ds:>12s}: {len(arr):6,d} examples  (mean={arr.mean():.3f}, min={arr.min():.2f}, max={arr.max():.2f})"
+        )
 
     binned = bin_data(data)
 

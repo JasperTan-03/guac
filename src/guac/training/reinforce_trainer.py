@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional
 
 try:
     import wandb
+
     _WANDB_AVAILABLE = True
 except ImportError:
     _WANDB_AVAILABLE = False
@@ -141,7 +142,9 @@ class ReinforceTrainer:
         if self.world_size > 1:
             logger.info(
                 "Distributed training detected: rank=%d/%d device=%s",
-                self.rank, self.world_size, self.device,
+                self.rank,
+                self.world_size,
+                self.device,
             )
 
         # ------------------------------------------------------------------
@@ -157,9 +160,7 @@ class ReinforceTrainer:
         logger.info("Loading training data from %s ...", train_path)
         all_records = load_jsonl(str(train_path))
 
-        self.records: List[Dict[str, Any]] = [
-            r for r in all_records if r.get("difficulty") is not None
-        ]
+        self.records: List[Dict[str, Any]] = [r for r in all_records if r.get("difficulty") is not None]
         n_dropped = len(all_records) - len(self.records)
         if not self.records:
             raise ValueError(
@@ -225,14 +226,14 @@ class ReinforceTrainer:
 
         if model_dtype == torch.bfloat16 and self.device.type != "cuda":
             logger.warning(
-                "Device %s does not reliably support bfloat16; coercing model "
-                "dtype to float32 for this run.",
+                "Device %s does not reliably support bfloat16; coercing model dtype to float32 for this run.",
                 self.device.type,
             )
             model_dtype = torch.float32
         self._model_dtype = model_dtype
         self._autocast_enabled = self.device.type == "cuda" and model_dtype in (
-            torch.bfloat16, torch.float16,
+            torch.bfloat16,
+            torch.float16,
         )
         self._autocast_dtype = model_dtype if self._autocast_enabled else torch.float32
 
@@ -280,7 +281,9 @@ class ReinforceTrainer:
         # Distributed wrapping
         # ------------------------------------------------------------------
         self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
-            self.model, self.optimizer, self.scheduler,
+            self.model,
+            self.optimizer,
+            self.scheduler,
         )
 
         # ------------------------------------------------------------------
@@ -298,9 +301,7 @@ class ReinforceTrainer:
             if wandb_entity:
                 wandb_kwargs["entity"] = str(wandb_entity)
             self._wandb_run = wandb.init(**wandb_kwargs)
-            logger.info(
-                "W&B run started: %s", self._wandb_run.id
-            )
+            logger.info("W&B run started: %s", self._wandb_run.id)
 
     # ------------------------------------------------------------------
     # Public API
@@ -408,7 +409,8 @@ class ReinforceTrainer:
                 per_example_gen_ids.append(gen_ids_i)
 
                 decoded = self.processor.tokenizer.decode(
-                    gen_ids_i, skip_special_tokens=True,
+                    gen_ids_i,
+                    skip_special_tokens=True,
                 ).strip()
                 reward = compute_reward(decoded, ground_truths[i])
                 batch_rewards.append(reward)
@@ -425,7 +427,9 @@ class ReinforceTrainer:
             # ----------------------------------------------------------
             self.model.train()
             policy_logprobs = self._compute_batch_log_probs(
-                batch_records, per_example_gen_ids, use_ref=False,
+                batch_records,
+                per_example_gen_ids,
+                use_ref=False,
             )
 
             # ----------------------------------------------------------
@@ -436,7 +440,9 @@ class ReinforceTrainer:
                 gen_model_unwrapped.eval()
                 with gen_model_unwrapped.disable_adapter():
                     ref_logprobs = self._compute_batch_log_probs(
-                        batch_records, per_example_gen_ids, use_ref=True,
+                        batch_records,
+                        per_example_gen_ids,
+                        use_ref=True,
                     )
             self.model.train()
 
@@ -444,7 +450,9 @@ class ReinforceTrainer:
             # Step 6: KL, advantages, EMA update, loss
             # ----------------------------------------------------------
             rewards_tensor = torch.tensor(
-                batch_rewards, dtype=torch.float32, device=self.device,
+                batch_rewards,
+                dtype=torch.float32,
+                device=self.device,
             )
             R_avg = rewards_tensor.mean().item()
 
@@ -453,10 +461,7 @@ class ReinforceTrainer:
 
             advantages = adjusted_rewards - self.ema_baseline
 
-            self.ema_baseline = (
-                self.ema_decay * self.ema_baseline
-                + (1 - self.ema_decay) * R_avg
-            )
+            self.ema_baseline = self.ema_decay * self.ema_baseline + (1 - self.ema_decay) * R_avg
 
             loss = -(advantages.detach() * policy_logprobs).mean()
             scaled_loss = loss / grad_accum
@@ -472,7 +477,8 @@ class ReinforceTrainer:
             # ----------------------------------------------------------
             if micro_step % grad_accum == 0:
                 self.accelerator.clip_grad_norm_(
-                    self.model.parameters(), max_grad_norm,
+                    self.model.parameters(),
+                    max_grad_norm,
                 )
                 self.optimizer.step()
                 self.optimizer.zero_grad()
@@ -487,9 +493,7 @@ class ReinforceTrainer:
                 avg_loss = running_loss / grad_accum
                 avg_kl = running_kl / grad_accum
 
-                should_log = (
-                    global_step % log_steps == 0 or global_step == 1
-                )
+                should_log = global_step % log_steps == 0 or global_step == 1
 
                 # Always update tqdm postfix for live terminal feedback.
                 if self.is_main:
@@ -546,12 +550,11 @@ class ReinforceTrainer:
         if self.is_main:
             final_dir = self.output_dir / "final"
             final_dir.mkdir(parents=True, exist_ok=True)
-            self.accelerator.unwrap_model(self.model).save_pretrained(
-                str(final_dir)
-            )
+            self.accelerator.unwrap_model(self.model).save_pretrained(str(final_dir))
             self.processor.save_pretrained(str(final_dir))
             logger.info(
-                "Training complete. Final checkpoint saved to %s", final_dir,
+                "Training complete. Final checkpoint saved to %s",
+                final_dir,
             )
             if self._wandb_run is not None:
                 wandb.finish()
@@ -560,9 +563,7 @@ class ReinforceTrainer:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _build_batch_inputs(
-        self, records: List[Dict[str, Any]]
-    ) -> tuple:
+    def _build_batch_inputs(self, records: List[Dict[str, Any]]) -> tuple:
         """Tokenise a batch of records in one processor call.
 
         Returns:
@@ -702,16 +703,20 @@ class ReinforceTrainer:
 
             gen_ids_2d = gen_ids.unsqueeze(0)  # (1, gen_len)
             full_ids = torch.cat(
-                [prompt_inputs["input_ids"], gen_ids_2d], dim=1,
+                [prompt_inputs["input_ids"], gen_ids_2d],
+                dim=1,
             )
-            full_mask = torch.cat([
-                prompt_inputs["attention_mask"],
-                torch.ones(
-                    (1, gen_len),
-                    dtype=prompt_inputs["attention_mask"].dtype,
-                    device=self.device,
-                ),
-            ], dim=1)
+            full_mask = torch.cat(
+                [
+                    prompt_inputs["attention_mask"],
+                    torch.ones(
+                        (1, gen_len),
+                        dtype=prompt_inputs["attention_mask"].dtype,
+                        device=self.device,
+                    ),
+                ],
+                dim=1,
+            )
 
             labels = full_ids.clone()
             labels[:, :prompt_len] = -100
@@ -789,17 +794,18 @@ class ReinforceTrainer:
         prompt_len = prompt_inputs["input_ids"].shape[1]
         gen_len = gen_ids.shape[1]
 
-        full_ids = torch.cat(
-            [prompt_inputs["input_ids"], gen_ids], dim=1
+        full_ids = torch.cat([prompt_inputs["input_ids"], gen_ids], dim=1)
+        full_mask = torch.cat(
+            [
+                prompt_inputs["attention_mask"],
+                torch.ones(
+                    (1, gen_len),
+                    dtype=prompt_inputs["attention_mask"].dtype,
+                    device=self.device,
+                ),
+            ],
+            dim=1,
         )
-        full_mask = torch.cat([
-            prompt_inputs["attention_mask"],
-            torch.ones(
-                (1, gen_len),
-                dtype=prompt_inputs["attention_mask"].dtype,
-                device=self.device,
-            ),
-        ], dim=1)
 
         labels = full_ids.clone()
         labels[:, :prompt_len] = -100
@@ -813,7 +819,8 @@ class ReinforceTrainer:
         if full_ids.shape[1] > max_seq:
             logger.warning(
                 "Sequence length %d exceeds max_seq_length=%d; truncating.",
-                full_ids.shape[1], max_seq,
+                full_ids.shape[1],
+                max_seq,
             )
             full_ids = full_ids[:, :max_seq]
             full_mask = full_mask[:, :max_seq]
@@ -865,17 +872,18 @@ class ReinforceTrainer:
         prompt_len = prompt_inputs["input_ids"].shape[1]
         gen_len = gen_ids.shape[1]
 
-        full_ids = torch.cat(
-            [prompt_inputs["input_ids"], gen_ids], dim=1
+        full_ids = torch.cat([prompt_inputs["input_ids"], gen_ids], dim=1)
+        full_mask = torch.cat(
+            [
+                prompt_inputs["attention_mask"],
+                torch.ones(
+                    (1, gen_len),
+                    dtype=prompt_inputs["attention_mask"].dtype,
+                    device=self.device,
+                ),
+            ],
+            dim=1,
         )
-        full_mask = torch.cat([
-            prompt_inputs["attention_mask"],
-            torch.ones(
-                (1, gen_len),
-                dtype=prompt_inputs["attention_mask"].dtype,
-                device=self.device,
-            ),
-        ], dim=1)
 
         labels = full_ids.clone()
         labels[:, :prompt_len] = -100
@@ -929,10 +937,7 @@ class ReinforceTrainer:
         """
         ckpt_dir = self.output_dir / f"step_{step}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        self.accelerator.unwrap_model(self.model).save_pretrained(
-            str(ckpt_dir)
-        )
+        self.accelerator.unwrap_model(self.model).save_pretrained(str(ckpt_dir))
         self.processor.save_pretrained(str(ckpt_dir))
         logger.info("Checkpoint saved to %s", ckpt_dir)
         return str(ckpt_dir)
-

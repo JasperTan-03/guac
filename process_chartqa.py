@@ -9,6 +9,7 @@ from guac.data.utils import encode_image, safe_load_image, strip_mc_from_text
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("chartqa_prep")
 
+
 def process_chartqa_train():
     split = "train"
     hf_id = "HuggingFaceM4/ChartQA"
@@ -38,12 +39,7 @@ def process_chartqa_train():
             skipped += 1
             continue
 
-        records.append({
-            "id": row_id,
-            "image": image_b64,
-            "prompt": prompt,
-            "answer": answer
-        })
+        records.append({"id": row_id, "image": image_b64, "prompt": prompt, "answer": answer})
 
     logger.info(f"Kept {len(records)}, skipped {skipped}")
 
@@ -64,6 +60,7 @@ def process_chartqa_train():
         print(f"Answer: {r['answer']}")
         print(f"Has Image: {r['image'] is not None}")
         print("-" * 20)
+
 
 if __name__ == "__main__":
     process_chartqa_train()

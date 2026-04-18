@@ -46,6 +46,7 @@ warnings.filterwarnings(
 
 try:
     import wandb
+
     _WANDB_AVAILABLE = True
 except ImportError:
     _WANDB_AVAILABLE = False
@@ -73,10 +74,9 @@ class CustomGRPOTrainer(GRPOTrainer):
         optimizer = super().create_optimizer()
         if optimizer is not None:
             # Filter out any parameter groups that have no parameters
-            optimizer.param_groups = [
-                group for group in optimizer.param_groups if len(group["params"]) > 0
-            ]
+            optimizer.param_groups = [group for group in optimizer.param_groups if len(group["params"]) > 0]
         return optimizer
+
 
 logger = logging.getLogger(__name__)
 
@@ -125,9 +125,7 @@ class GUACGRPOTrainer:
         logger.info("Loading training data from %s ...", train_path)
         all_records = load_jsonl(str(train_path))
 
-        self.records: List[Dict[str, Any]] = [
-            r for r in all_records if r.get("difficulty") is not None
-        ]
+        self.records: List[Dict[str, Any]] = [r for r in all_records if r.get("difficulty") is not None]
         n_dropped = len(all_records) - len(self.records)
         if not self.records:
             raise ValueError(
@@ -197,8 +195,7 @@ class GUACGRPOTrainer:
             logger.info("W&B run started: %s", self._wandb_run.id)
 
         logger.info(
-            "GUACGRPOTrainer initialised: model=%s, T_init=%.3f, "
-            "num_epochs=%d, steps_per_epoch=%d, num_generations=%d",
+            "GUACGRPOTrainer initialised: model=%s, T_init=%.3f, num_epochs=%d, steps_per_epoch=%d, num_generations=%d",
             cfg.model.name,
             self.curriculum.T,
             int(tcfg.num_epochs),
@@ -278,7 +275,8 @@ class GUACGRPOTrainer:
             prev_ckpt = self._latest_checkpoint()
 
             grpo_config = self._build_grpo_config(
-                epoch=epoch, max_steps=steps_per_epoch,
+                epoch=epoch,
+                max_steps=steps_per_epoch,
             )
 
             # tqdm update callback — max_steps=steps_per_epoch means the
@@ -381,6 +379,7 @@ class GUACGRPOTrainer:
                 # "base_model.model.…lora_A.default.weight".
                 # We insert "default" before ".weight" for all lora_ keys.
                 import re as _re
+
                 _lora_key_pattern = _re.compile(r"(\.lora_[AB])(\.weight)$")
                 remapped_sd = {}
                 for k, v in saved_sd.items():
@@ -389,19 +388,15 @@ class GUACGRPOTrainer:
 
                 if all("lora_" not in k for k in remapped_sd):
                     logger.warning(
-                        "Adapter checkpoint keys don't contain 'lora_' — "
-                        "weights may not have loaded correctly."
+                        "Adapter checkpoint keys don't contain 'lora_' — weights may not have loaded correctly."
                     )
                 else:
                     # The model is not yet ZeRO-sharded at this point — sharding
                     # happens inside trainer.train() → accelerator.prepare().
                     # Plain load_state_dict works correctly on the unsharded PEFT model.
-                    missing, unexpected = trainer.model.load_state_dict(
-                        remapped_sd, strict=False
-                    )
+                    missing, unexpected = trainer.model.load_state_dict(remapped_sd, strict=False)
                     logger.info(
-                        "Loaded LoRA adapter from %s "
-                        "(missing=%d, unexpected=%d).",
+                        "Loaded LoRA adapter from %s (missing=%d, unexpected=%d).",
                         prev_ckpt,
                         len(missing),
                         len(unexpected),
@@ -422,9 +417,7 @@ class GUACGRPOTrainer:
             self.curriculum.update(R_avg)
 
             if self._is_main and pbar is not None:
-                pbar.set_description(
-                    f"Epoch {epoch}/{num_epochs} done | R_avg={R_avg:.4f} | T={self.curriculum.T:.3f}"
-                )
+                pbar.set_description(f"Epoch {epoch}/{num_epochs} done | R_avg={R_avg:.4f} | T={self.curriculum.T:.3f}")
 
             # Log curriculum metrics to W&B
             if self._is_main and self._wandb_run is not None:
@@ -551,9 +544,7 @@ class GUACGRPOTrainer:
         # Multimodal content-part list: [{"type": "text", "text": "..."}, ...]
         if isinstance(content, list):
             return " ".join(
-                part.get("text", "")
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
+                part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"
             )
         return str(content)
 
@@ -598,6 +589,7 @@ class GUACGRPOTrainer:
             Callable with signature ``(completions, **kwargs) -> List[float]``.
         """
         import re as _re
+
         _think_open = _re.compile(r"<think>", _re.IGNORECASE)
         _think_close = _re.compile(r"</think>", _re.IGNORECASE)
         _extract = GUACGRPOTrainer._extract_completion_text
@@ -637,56 +629,45 @@ class GUACGRPOTrainer:
         return GRPOConfig(
             # Output
             output_dir=epoch_output,
-
             # Batch size / steps — max_steps is set to steps_per_epoch so
             # each trainer instance runs for exactly one curriculum epoch.
             per_device_train_batch_size=int(tcfg.per_device_train_batch_size),
             gradient_accumulation_steps=int(tcfg.gradient_accumulation_steps),
             max_steps=max_steps,
             num_generations=int(tcfg.num_generations),
-
             # Optimiser
             learning_rate=float(tcfg.learning_rate),
             weight_decay=float(tcfg.weight_decay),
             max_grad_norm=float(tcfg.max_grad_norm),
             warmup_steps=int(tcfg.warmup_steps),
-
             # Generation parameters
             max_completion_length=int(tcfg.max_completion_length),
             temperature=float(tcfg.temperature),
             top_p=float(tcfg.top_p),
-
             # vLLM server integration
             use_vllm=True,
             vllm_mode="server",
             vllm_server_host=str(tcfg.vllm_server_host),
             vllm_server_port=int(tcfg.vllm_server_port),
-
             # KL penalty coefficient.  TRL default is 0.04 (GRPO paper value),
             # but 0.1 better prevents rapid policy divergence on VLMs where the
             # reward signal is sparse early in training.
             beta=float(tcfg.get("grpo_beta", 0.1)),
-
             # On-policy: use each group of completions for exactly 1 gradient
             # update.  num_iterations > 1 would make GRPO off-policy.
             num_iterations=1,
-
             # Precision (A6000s support bf16)
             bf16=True,
-
             # Logging — only log to W&B; suppress TRL's own console progress
             # bar and step-level prints so the tqdm bar is the sole output.
             logging_steps=int(tcfg.log_steps),
             save_steps=int(tcfg.save_steps),
             disable_tqdm=True,
             log_on_each_node=False,
-
             # Report to W&B (TRL logs train/* metrics natively)
             report_to="wandb" if self._is_main else "none",
-
             # Don't run eval during GRPO epochs (no eval set configured)
             do_eval=False,
-
             # Don't skip batches in the new epoch's dataset when resuming
             ignore_data_skip=True,
         )
@@ -706,9 +687,7 @@ class GUACGRPOTrainer:
         return valid_ckpts[-1] if valid_ckpts else None
 
     @staticmethod
-    def _extract_avg_reward(
-        trainer: GRPOTrainer, steps_per_epoch: int
-    ) -> float:
+    def _extract_avg_reward(trainer: GRPOTrainer, steps_per_epoch: int) -> float:
         """Extract the mean reward over the *current* epoch from log history.
 
         ``GRPOTrainer`` logs ``reward`` (or ``train/reward``) to
@@ -754,7 +733,8 @@ class GUACGRPOTrainer:
                 "No reward entries found in trainer log history for "
                 "steps (%d, %d].  Returning R_avg=0.0.  "
                 "This is normal on a 1-step smoke test.",
-                epoch_start, current_step,
+                epoch_start,
+                current_step,
             )
             return 0.0
 

@@ -42,9 +42,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Data-parallel sharding
 # ---------------------------------------------------------------------------
-def shard_records(
-    records: List[Dict], rank: int, world_size: int
-) -> List[Dict]:
+def shard_records(records: List[Dict], rank: int, world_size: int) -> List[Dict]:
     """Return the subset of ``records`` owned by ``rank`` under index-modulo sharding.
 
     Data-parallel helper: run ``world_size`` copies of the judge, each with
@@ -68,18 +66,14 @@ def shard_records(
     if world_size <= 1:
         return list(records)
     if not (0 <= rank < world_size):
-        raise ValueError(
-            f"rank {rank} out of range for world_size {world_size}"
-        )
+        raise ValueError(f"rank {rank} out of range for world_size {world_size}")
     return [r for i, r in enumerate(records) if i % world_size == rank]
 
 
 # ---------------------------------------------------------------------------
 # Output parser (argmax from raw text — kept for diagnostics + text fallback)
 # ---------------------------------------------------------------------------
-def parse_difficulty_score(
-    response: str, score_max: int = 10
-) -> Optional[float]:
+def parse_difficulty_score(response: str, score_max: int = 10) -> Optional[float]:
     """Extract the first number in ``[1.0, score_max]`` from a raw VLM response.
 
     Handles common malformed patterns such as:
@@ -204,9 +198,7 @@ def compute_continuous_difficulty(
 # ---------------------------------------------------------------------------
 # Prompt builder
 # ---------------------------------------------------------------------------
-def build_messages(
-    system_prompt: str, prompt: str, image_b64: Optional[str]
-) -> List[Dict]:
+def build_messages(system_prompt: str, prompt: str, image_b64: Optional[str]) -> List[Dict]:
     """Build an OpenAI-style chat message list for vLLM chat inference.
 
     The system turn contains the rubric (passed in from config). The user
@@ -350,9 +342,7 @@ class DifficultyJudge:
         in_path = Path(input_path)
         out_path = Path(output_path)
         ckpt_path = (
-            Path(checkpoint_path)
-            if checkpoint_path is not None
-            else out_path.with_suffix(out_path.suffix + ".ckpt")
+            Path(checkpoint_path) if checkpoint_path is not None else out_path.with_suffix(out_path.suffix + ".ckpt")
         )
 
         # ------------------------------------------------------------------
@@ -390,9 +380,7 @@ class DifficultyJudge:
             logger.info("Checkpoint found at %s — resuming.", ckpt_path)
             completed_results = load_jsonl(str(ckpt_path))
             processed_ids = {r["id"] for r in completed_results}
-            logger.info(
-                "%d rows already processed (from checkpoint).", len(completed_results)
-            )
+            logger.info("%d rows already processed (from checkpoint).", len(completed_results))
 
         pending: List[Dict] = [r for r in records if r["id"] not in processed_ids]
         logger.info("%d records pending inference.", len(pending))
@@ -418,9 +406,7 @@ class DifficultyJudge:
             raw_results = self._run_batch(batch_records)
 
             for rec, (raw_response, lp0) in zip(batch_records, raw_results):
-                expectation, probs = compute_continuous_difficulty(
-                    lp0, self._tokenizer, self._score_max
-                )
+                expectation, probs = compute_continuous_difficulty(lp0, self._tokenizer, self._score_max)
                 text_value = parse_difficulty_score(raw_response, self._score_max)
 
                 if expectation is not None:
@@ -433,9 +419,7 @@ class DifficultyJudge:
                 parse_error = difficulty is None
 
                 if parse_error:
-                    logger.warning(
-                        "Parse error | id=%s | raw=%r", rec.get("id"), raw_response
-                    )
+                    logger.warning("Parse error | id=%s | raw=%r", rec.get("id"), raw_response)
 
                 annotated: Dict = {
                     "id": rec["id"],
@@ -455,9 +439,7 @@ class DifficultyJudge:
 
             if rows_since_ckpt >= checkpoint_interval:
                 all_so_far = completed_results + new_results
-                logger.info(
-                    "Checkpointing %d rows -> %s", len(all_so_far), ckpt_path
-                )
+                logger.info("Checkpointing %d rows -> %s", len(all_so_far), ckpt_path)
                 ckpt_path.parent.mkdir(parents=True, exist_ok=True)
                 save_jsonl(all_so_far, str(ckpt_path))
                 rows_since_ckpt = 0
@@ -489,9 +471,7 @@ class DifficultyJudge:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
-    def _run_batch(
-        self, batch: List[Dict]
-    ) -> List[Tuple[str, Optional[Dict[int, Any]]]]:
+    def _run_batch(self, batch: List[Dict]) -> List[Tuple[str, Optional[Dict[int, Any]]]]:
         """Run inference on a batch of records via ``llm.chat()``.
 
         Builds conversation lists for every record in ``batch`` and submits
@@ -513,9 +493,7 @@ class DifficultyJudge:
         conversations: List[List[Dict]] = []
         for rec in batch:
             image_b64: Optional[str] = rec.get("image") or None
-            messages = build_messages(
-                self._system_prompt, rec["prompt"], image_b64
-            )
+            messages = build_messages(self._system_prompt, rec["prompt"], image_b64)
             conversations.append(messages)
 
         def _extract(output_obj: Any) -> Tuple[str, Optional[Dict[int, Any]]]:
@@ -526,9 +504,7 @@ class DifficultyJudge:
             return text, lp0
 
         try:
-            outputs = self._llm.chat(
-                conversations, sampling_params=self._sampling_params
-            )
+            outputs = self._llm.chat(conversations, sampling_params=self._sampling_params)
             return [_extract(out) for out in outputs]
 
         except Exception as exc:
@@ -539,9 +515,7 @@ class DifficultyJudge:
             results: List[Tuple[str, Optional[Dict[int, Any]]]] = []
             for conversation, rec in zip(conversations, batch):
                 try:
-                    single_out = self._llm.chat(
-                        [conversation], sampling_params=self._sampling_params
-                    )
+                    single_out = self._llm.chat([conversation], sampling_params=self._sampling_params)
                     results.append(_extract(single_out[0]))
                 except Exception as item_exc:
                     logger.error(

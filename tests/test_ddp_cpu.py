@@ -114,31 +114,25 @@ def _run_rank(rank: int, tmp_dir: str) -> None:
             trainer = GRPOTrainer(cfg)
 
             assert trainer.world_size == WORLD_SIZE, (
-                f"rank {rank}: expected world_size={WORLD_SIZE}, "
-                f"got {trainer.world_size}"
+                f"rank {rank}: expected world_size={WORLD_SIZE}, got {trainer.world_size}"
             )
-            assert trainer.rank == rank, (
-                f"rank {rank}: trainer.rank={trainer.rank}"
-            )
+            assert trainer.rank == rank, f"rank {rank}: trainer.rank={trainer.rank}"
 
             # ── Run 2 optimizer steps ──
             trainer.train()
 
         # ── Post-training checks ──
-        assert 0.0 <= trainer.curriculum.T <= 1.0, (
-            f"rank {rank}: T={trainer.curriculum.T} out of bounds"
-        )
+        assert 0.0 <= trainer.curriculum.T <= 1.0, f"rank {rank}: T={trainer.curriculum.T} out of bounds"
 
         if rank == 0:
             final_dir = Path(f"{tmp_dir}/ckpt/final")
-            assert final_dir.exists(), (
-                f"rank 0: final checkpoint missing at {final_dir}"
-            )
+            assert final_dir.exists(), f"rank 0: final checkpoint missing at {final_dir}"
 
         print(f"[rank {rank}] ALL CHECKS PASSED (T={trainer.curriculum.T:.4f})", flush=True)
 
     except Exception:
         import traceback
+
         traceback.print_exc()
         raise
 

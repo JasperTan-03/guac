@@ -89,9 +89,7 @@ def main(cfg: DictConfig) -> None:
     if world_size < 1:
         raise ValueError(f"judge.world_size must be >= 1, got {world_size}")
     if not (0 <= rank < world_size):
-        raise ValueError(
-            f"judge.rank={rank} out of range for judge.world_size={world_size}"
-        )
+        raise ValueError(f"judge.rank={rank} out of range for judge.world_size={world_size}")
 
     log.info(
         "Starting difficulty judging | model=%s | batch_size=%d | splits=%s | score_max=%d | rank=%d/%d",
@@ -108,9 +106,7 @@ def main(cfg: DictConfig) -> None:
     for split in splits:
         input_path = processed_dir / f"{split}.jsonl"
         if world_size > 1:
-            output_path = (
-                scored_dir / f"{split}.part{rank}-of-{world_size}.jsonl"
-            )
+            output_path = scored_dir / f"{split}.part{rank}-of-{world_size}.jsonl"
         else:
             output_path = scored_dir / f"{split}.jsonl"
 
